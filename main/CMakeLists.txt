@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "llm.c"
+idf_component_register(SRCS "ws_matrix.c" "main.c" "llm.c"
                     INCLUDE_DIRS ""  LDFRAGMENTS "../linker.lf")
 
 

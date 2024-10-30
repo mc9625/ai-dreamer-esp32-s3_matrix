@@ -9,8 +9,20 @@
 #include <string.h>
 #include "esp_random.h"
 
+#include "ws_matrix.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#define MIN_INITIAL_NODES 20
+#define MAX_INITIAL_NODES 40
 
 static const char *TAG = "MAIN";
+
+#define FADE_STEPS 20
+#define FADE_DELAY_MS 30
+#define FLASH_BRIGHTNESS 180
+#define NORMAL_BRIGHTNESS 60
+
 
 /**
  * @brief intializes SPIFFS storage
@@ -100,9 +112,37 @@ unsigned long long get_random_seed(void) {
     
     return seed;
 }
+
+void initialize_matrix_pattern(void) {
+    rgb_color_t blue = {.r = 0, .g = 0, .b = 60};
+    matrix_clear();
+    
+    int initialNodes = MIN_INITIAL_NODES + (esp_random() % (MAX_INITIAL_NODES - MIN_INITIAL_NODES));
+    
+    for (int i = 0; i < initialNodes; i++) {
+        int x = esp_random() % MATRIX_COLS;
+        int y = esp_random() % MATRIX_ROWS;
+        
+        // Simple fade in using matrix_set_brightness()
+        for(int step = 0; step <= FADE_STEPS; step++) {
+            matrix_set_brightness((step * NORMAL_BRIGHTNESS) / FADE_STEPS);
+            matrix_set_pixel(x, y, blue);
+            matrix_show();
+            vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS));
+        }
+        matrix_set_brightness(NORMAL_BRIGHTNESS);
+    }
+}
+
 void app_main(void)
 {
+    ESP_ERROR_CHECK(matrix_init());
+    matrix_set_brightness(40);
+    test_matrix(); 
     
+    // Show initial pattern
+    initialize_matrix_pattern();
+
     write_display("Loading Model");
     init_storage();
 
