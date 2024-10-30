@@ -116,21 +116,78 @@ unsigned long long get_random_seed(void) {
 void initialize_matrix_pattern(void) {
     rgb_color_t blue = {.r = 0, .g = 0, .b = 60};
     matrix_clear();
+
+    typedef struct {
+        int x;
+        int y;
+        int step;
+        int fade_steps;
+        int delay;
+        bool completed;
+    } AnimNode;
     
-    int initialNodes = MIN_INITIAL_NODES + (esp_random() % (MAX_INITIAL_NODES - MIN_INITIAL_NODES));
+    #define MAX_CONCURRENT_NODES 2
+    #define MAX_NODES_PER_CLUSTER 3
     
-    for (int i = 0; i < initialNodes; i++) {
-        int x = esp_random() % MATRIX_COLS;
-        int y = esp_random() % MATRIX_ROWS;
-        
-        // Simple fade in using matrix_set_brightness()
-        for(int step = 0; step <= FADE_STEPS; step++) {
-            matrix_set_brightness((step * NORMAL_BRIGHTNESS) / FADE_STEPS);
-            matrix_set_pixel(x, y, blue);
-            matrix_show();
-            vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS));
+    AnimNode active_nodes[MAX_NODES_PER_CLUSTER * MAX_CONCURRENT_NODES] = {0};
+    int total_nodes = MIN_INITIAL_NODES + (esp_random() % (MAX_INITIAL_NODES - MIN_INITIAL_NODES));
+    int nodes_created = 0;
+    int active_clusters = 0;
+
+    while(nodes_created < total_nodes || active_clusters > 0) {
+        // Add new cluster if possible
+        if(nodes_created < total_nodes && active_clusters < MAX_CONCURRENT_NODES) {
+            int nodes_in_cluster = 1 + (esp_random() % MAX_NODES_PER_CLUSTER);
+            int base_idx = active_clusters * MAX_NODES_PER_CLUSTER;
+            
+            for(int i = 0; i < nodes_in_cluster && nodes_created < total_nodes; i++) {
+                active_nodes[base_idx + i].x = esp_random() % MATRIX_COLS;
+                active_nodes[base_idx + i].y = esp_random() % MATRIX_ROWS;
+                active_nodes[base_idx + i].step = 0;
+                active_nodes[base_idx + i].fade_steps = FADE_STEPS + (esp_random() % 10);
+                active_nodes[base_idx + i].delay = FADE_DELAY_MS + (esp_random() % 20);
+                active_nodes[base_idx + i].completed = false;
+                nodes_created++;
+            }
+            active_clusters++;
         }
-        matrix_set_brightness(NORMAL_BRIGHTNESS);
+
+        // Animate all active nodes
+        for(int c = 0; c < active_clusters; c++) {
+            int cluster_completed = true;
+            int base_idx = c * MAX_NODES_PER_CLUSTER;
+            
+            for(int i = 0; i < MAX_NODES_PER_CLUSTER; i++) {
+                AnimNode* node = &active_nodes[base_idx + i];
+                if(node->step <= node->fade_steps && !node->completed) {
+                    cluster_completed = false;
+                    if(node->step < node->fade_steps) {
+                        uint8_t brightness = (node->step * NORMAL_BRIGHTNESS) / node->fade_steps;
+                        rgb_color_t curr_color = {.r = 0, .g = 0, .b = brightness};
+                        matrix_set_pixel(node->x, node->y, curr_color);
+                        node->step++;
+                    } else {
+                        rgb_color_t final_color = {.r = 0, .g = 0, .b = NORMAL_BRIGHTNESS};
+                        matrix_set_pixel(node->x, node->y, final_color);
+                        node->completed = true;
+                    }
+                }
+            }
+
+            if(cluster_completed) {
+                // Remove this cluster by shifting others down
+                if(c < active_clusters - 1) {
+                    for(int j = 0; j < MAX_NODES_PER_CLUSTER; j++) {
+                        active_nodes[base_idx + j] = active_nodes[base_idx + j + MAX_NODES_PER_CLUSTER];
+                    }
+                }
+                active_clusters--;
+                c--; // Recheck this position
+            }
+        }
+        
+        matrix_show();
+        vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS));
     }
 }
 
