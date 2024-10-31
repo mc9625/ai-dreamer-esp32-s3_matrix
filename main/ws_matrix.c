@@ -3,50 +3,23 @@
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
-#define DEFAULT_BRIGHTNESS 40  // Safe default brightness level
-#define MAX_BRIGHTNESS 60     // Maximum safe brightness limit
-#define FADE_STEPS 20
-#define FADE_DELAY_MS 30
-#define FLASH_BRIGHTNESS 180
-#define NORMAL_BRIGHTNESS 60
-
-static const char* TAG = "WS_MATRIX";
+#include <stdlib.h>
 
 // WS2812B timing (in RMT ticks, 1 tick = 25ns with clock divider of 2)
 #define RMT_CLK_DIV 2
-#define T0H 12     // 0.4us
-#define T0L 28     // 0.85us  
-#define T1H 24     // 0.8us
-#define T1L 16     // 0.45us
+#define T0H 12    // 0.4us
+#define T0L 28    // 0.85us  
+#define T1H 24    // 0.8us
+#define T1L 16    // 0.45us
 
+static const char* TAG = "WS_MATRIX";
+
+// Global state variables
 static rmt_channel_t rmt_channel = RMT_CHANNEL_0;
 static rgb_color_t framebuffer[MATRIX_ROWS][MATRIX_COLS] = {0};
-static uint8_t brightness = 40;
-
-static void fade_in_pixel(uint8_t x, uint8_t y, rgb_color_t color) {
-    rgb_color_t temp_color = color;
-    
-    // Fade in
-    for(int i = 0; i <= FADE_STEPS; i++) {
-        brightness = (i * NORMAL_BRIGHTNESS) / FADE_STEPS;
-        matrix_set_pixel(x, y, temp_color);
-        matrix_show();
-        vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS));
-    }
-    
-    // Flash white
-    brightness = FLASH_BRIGHTNESS;
-    temp_color.r = temp_color.g = temp_color.b = 255;
-    matrix_set_pixel(x, y, temp_color);
-    matrix_show();
-    vTaskDelay(pdMS_TO_TICKS(50));
-    
-    // Return to blue
-    brightness = NORMAL_BRIGHTNESS;
-    matrix_set_pixel(x, y, color);
-    matrix_show();
-}
+static uint8_t brightness = DEFAULT_BRIGHTNESS;
+static bool node_active[MATRIX_ROWS][MATRIX_COLS] = {0};
+static int total_active_nodes = 0;
 
 esp_err_t matrix_init(void) {
     ESP_LOGI(TAG, "Initializing LED matrix...");
@@ -61,14 +34,12 @@ esp_err_t matrix_init(void) {
     ESP_ERROR_CHECK(rmt_config(&config));
     ESP_ERROR_CHECK(rmt_driver_install(config.channel, 0, 0));
     
-    // Reset all LEDs
     matrix_clear();
     vTaskDelay(pdMS_TO_TICKS(100));
     
     ESP_LOGI(TAG, "Matrix initialization complete");
     return ESP_OK;
 }
-
 
 static void ws2812_send_pixel(rgb_color_t color) {
     static rmt_item32_t pixels[24];
@@ -132,8 +103,10 @@ void matrix_clear(void) {
     for (int y = 0; y < MATRIX_ROWS; y++) {
         for (int x = 0; x < MATRIX_COLS; x++) {
             framebuffer[y][x] = black;
+            node_active[y][x] = false;
         }
     }
+    total_active_nodes = 0;
     matrix_show();
 }
 
@@ -141,21 +114,108 @@ void matrix_set_brightness(uint8_t new_brightness) {
     brightness = (new_brightness > MAX_BRIGHTNESS) ? MAX_BRIGHTNESS : new_brightness;
 }
 
-uint32_t matrix_color(uint8_t r, uint8_t g, uint8_t b) {
-    return (uint32_t)(r << 16) | (g << 8) | b;
+void fade_in_single_pixel(uint8_t x, uint8_t y, rgb_color_t color) {
+    // Determine target brightness based on current brightness
+    uint8_t current_brightness = node_active[y][x] ? NORMAL_BRIGHTNESS + ((total_active_nodes % 3) + 1) * 20 : 0;
+    uint8_t target_brightness;
+    
+    if (current_brightness == 0) {
+        target_brightness = NORMAL_BRIGHTNESS;
+    } else if (current_brightness < MAX_BRIGHTNESS) {
+        target_brightness = current_brightness + 20;
+        if (target_brightness > MAX_BRIGHTNESS) {
+            target_brightness = MAX_BRIGHTNESS;
+        }
+    } else {
+        target_brightness = MAX_BRIGHTNESS;
+    }
+
+    // Fade in from current brightness
+    rgb_color_t temp_color;
+    for (int i = 0; i <= FADE_STEPS; i++) {
+        uint8_t current = current_brightness + 
+            ((target_brightness - current_brightness) * i) / FADE_STEPS;
+
+        temp_color.r = 0;
+        temp_color.g = 0;
+        temp_color.b = current;
+
+        matrix_set_pixel(x, y, temp_color);
+        matrix_show();
+        vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS));
+    }
+
+    // Flash white
+    matrix_set_pixel(x, y, (rgb_color_t){255, 255, 255});
+    matrix_show();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Return to final color
+    temp_color.r = 0;
+    temp_color.g = 0;
+    temp_color.b = target_brightness;
+    matrix_set_pixel(x, y, temp_color);
+    matrix_show();
+
+    // Update node state
+    if (!node_active[y][x]) {
+        node_active[y][x] = true;
+        total_active_nodes++;
+    }
 }
-
-
 
 void test_matrix(void) {
     ESP_LOGI(TAG, "Starting matrix test");
-    rgb_color_t blue = {.r = 0, .g = 0, .b = 60};
+    
+    // Adjusted Google colors
+    rgb_color_t google_blue = {.r = 10, .g = 50, .b = 255};
+    rgb_color_t google_red = {.r = 255, .g = 30, .b = 30};
+    rgb_color_t google_yellow = {.r = 255, .g = 180, .b = 0};
+    rgb_color_t google_green = {.r = 30, .g = 255, .b = 30};
     
     matrix_clear();
     vTaskDelay(pdMS_TO_TICKS(500));
     
-    fade_in_pixel(0, 0, blue);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    const struct {
+        int x;
+        int y;
+        rgb_color_t color;
+    } leds[] = {
+        {2, 3, google_blue},
+        {3, 3, google_red},
+        {4, 3, google_yellow},
+        {5, 3, google_green}
+    };
     
+    const int QUICK_FADE_STEPS = 10;     
+    const int QUICK_FADE_DELAY = 15;     
+    
+    for (int led = 0; led < 4; led++) {
+        for (int step = 0; step <= QUICK_FADE_STEPS; step++) {
+            uint8_t step_brightness = (step * 255) / QUICK_FADE_STEPS;
+            
+            rgb_color_t temp_color = {
+                .r = (leds[led].color.r * step_brightness) / 255,
+                .g = (leds[led].color.g * step_brightness) / 255,
+                .b = (leds[led].color.b * step_brightness) / 255
+            };
+            
+            matrix_set_pixel(leds[led].x, leds[led].y, temp_color);
+            matrix_show();
+            vTaskDelay(pdMS_TO_TICKS(QUICK_FADE_DELAY));
+        }
+        
+        rgb_color_t normal_color = {
+            .r = (leds[led].color.r * 60) / 255,
+            .g = (leds[led].color.g * 60) / 255,
+            .b = (leds[led].color.b * 60) / 255
+        };
+        
+        matrix_set_pixel(leds[led].x, leds[led].y, normal_color);
+        matrix_show();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(1000));
     matrix_clear();
 }

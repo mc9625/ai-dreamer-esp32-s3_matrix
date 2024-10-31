@@ -8,104 +8,58 @@
 #include "llm.h"
 #include <string.h>
 #include "esp_random.h"
-
 #include "ws_matrix.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+// Matrix pattern constants
 #define MIN_INITIAL_NODES 20
 #define MAX_INITIAL_NODES 40
 
 static const char *TAG = "MAIN";
 
-#define FADE_STEPS 20
-#define FADE_DELAY_MS 30
-#define FLASH_BRIGHTNESS 180
-#define NORMAL_BRIGHTNESS 60
-
-
-/**
- * @brief intializes SPIFFS storage
- * 
- */
-void init_storage(void)
-{
-
+static esp_err_t init_storage(void) {
     ESP_LOGI(TAG, "Initializing SPIFFS");
 
     esp_vfs_spiffs_conf_t conf = {
         .base_path = "/data",
         .partition_label = NULL,
         .max_files = 5,
-        .format_if_mount_failed = false};
+        .format_if_mount_failed = false
+    };
 
     esp_err_t ret = esp_vfs_spiffs_register(&conf);
-
-    if (ret != ESP_OK)
-    {
-        if (ret == ESP_FAIL)
-        {
+    if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
             ESP_LOGE(TAG, "Failed to mount or format filesystem");
-        }
-        else if (ret == ESP_ERR_NOT_FOUND)
-        {
+        } else if (ret == ESP_ERR_NOT_FOUND) {
             ESP_LOGE(TAG, "Failed to find SPIFFS partition");
-        }
-        else
-        {
+        } else {
             ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
         }
-        return;
+        return ret;
     }
 
     size_t total = 0, used = 0;
     ret = esp_spiffs_info(NULL, &total, &used);
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to get SPIFFS partition information (%s)", esp_err_to_name(ret));
-    }
-    else
-    {
+    if (ret == ESP_OK) {
         ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
     }
+    
+    return ret;
 }
 
-/**
- * @brief Outputs to display
- * 
- * @param text The text to output
- */
-void write_display(char *text)
-{
-    printf(text);
+static void generate_complete_cb(float tk_s) {
+    printf("%.2f tok/s\n", tk_s);
 }
 
-/**
- * @brief Callbacks once generation is done
- * 
- * @param tk_s The number of tokens per second generated
- */
-void generate_complete_cb(float tk_s)
-{
-    char buffer[50];
-    sprintf(buffer, "%.2f tok/s", tk_s);
-    write_display(buffer);
-}
-
-/**
- * @brief Draws a llama onscreen
- * 
- */
-unsigned long long get_random_seed(void) {
-    // Get a high-quality 64-bit seed combining two 32-bit values
+static unsigned long long get_random_seed(void) {
     unsigned long long high = esp_random();
     unsigned long long low = esp_random();
     unsigned long long seed = (high << 32) | low;
     
-    // Add a small amount of time-based entropy
     seed ^= (unsigned long long)time(NULL);
     
-    // Make sure we never return 0 or small values
     if (seed < 1000000) {
         seed += 1000000;
     }
@@ -152,7 +106,7 @@ void initialize_matrix_pattern(void) {
             active_clusters++;
         }
 
-        // Animate all active nodes
+        // Animate active nodes
         for(int c = 0; c < active_clusters; c++) {
             int cluster_completed = true;
             int base_idx = c * MAX_NODES_PER_CLUSTER;
@@ -175,14 +129,14 @@ void initialize_matrix_pattern(void) {
             }
 
             if(cluster_completed) {
-                // Remove this cluster by shifting others down
+                // Remove completed cluster
                 if(c < active_clusters - 1) {
                     for(int j = 0; j < MAX_NODES_PER_CLUSTER; j++) {
                         active_nodes[base_idx + j] = active_nodes[base_idx + j + MAX_NODES_PER_CLUSTER];
                     }
                 }
                 active_clusters--;
-                c--; // Recheck this position
+                c--;
             }
         }
         
@@ -191,54 +145,52 @@ void initialize_matrix_pattern(void) {
     }
 }
 
-void app_main(void)
-{
+void activate_new_node_task(void *arg) {
+    rgb_color_t blue = {.r = 0, .g = 0, .b = 60};
+    int x = *((int*)arg);
+    int y = *((int*)arg + 1);
+
+    fade_in_single_pixel(x, y, blue);
+    free(arg);
+    vTaskDelete(NULL);
+}
+
+void app_main(void) {
+    // Initialize matrix and show initial patterns
+   
     ESP_ERROR_CHECK(matrix_init());
+    matrix_clear();
     matrix_set_brightness(40);
     test_matrix(); 
-    
-    // Show initial pattern
     initialize_matrix_pattern();
 
-    write_display("Loading Model");
-    init_storage();
+    // Initialize storage and LLM
+    ESP_ERROR_CHECK(init_storage());
 
-    // default parameters
-    char *checkpoint_path = "/data/aidreams260K.bin"; // e.g. out/model.bin
+    // LLM configuration
+    char *checkpoint_path = "/data/aidreams260K.bin";
     char *tokenizer_path = "/data/tok512.bin";
-    float temperature = 0.8f;        // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-    float topp = 0.9f;               // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-    int steps = 256;                 // number of steps to run for
-    char *prompt = NULL;             // prompt string
-    // In app_main
+    float temperature = 0.8f;
+    float topp = 0.9f;
+    int steps = 256;
     unsigned long long rng_seed = get_random_seed();
 
-    if (rng_seed <= 0) {
-        // Use time as base, but mix in some hardware entropy
-        rng_seed = (unsigned long long)time(NULL);
-        // XOR with a single hardware random value
-        rng_seed ^= esp_random();
+    // Initialize transformer components
+    Transformer transformer;
+    ESP_LOGI(TAG, "Loading model from %s", checkpoint_path);
+    build_transformer(&transformer, checkpoint_path);
+    
+    if (steps == 0 || steps > transformer.config.seq_len) {
+        steps = transformer.config.seq_len;
     }
 
-
-
-    // build the Transformer via the model .bin file
-    Transformer transformer;
-    ESP_LOGI(TAG, "LLM Path is %s", checkpoint_path);
-    build_transformer(&transformer, checkpoint_path);
-    if (steps == 0 || steps > transformer.config.seq_len)
-        steps = transformer.config.seq_len; // override to ~max length
-
-    // build the Tokenizer via the tokenizer .bin file
     Tokenizer tokenizer;
     build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
 
-    // build the Sampler
     Sampler sampler;
     ESP_LOGI(TAG, "Creating sampler with temperature=%f, topp=%f", temperature, topp);
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
 
-    // run!
-
-    generate(&transformer, &tokenizer, &sampler, prompt, steps, &generate_complete_cb);
+    // Start generation
+    generate(&transformer, &tokenizer, &sampler, NULL, steps, &generate_complete_cb);
 }

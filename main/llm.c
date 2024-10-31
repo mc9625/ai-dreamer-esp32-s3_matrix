@@ -18,6 +18,8 @@
 #include "esp_system.h"
 #include "esp_dsp.h"
 #include "esp_attr.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define MAP_FAILED NULL
 #define munmap(ptr, length) custom_munmap(ptr)
@@ -76,6 +78,7 @@ MatMulTaskParams *matmul_params = NULL;
 
 SemaphoreHandle_t semaDataReady;
 SemaphoreHandle_t semaForwardDataReady;
+
 
 void matmul_task(void *params);
 void forward_task(void *params);
@@ -295,48 +298,30 @@ void softmax(v4sf *x, int size)
     }
 }
 
-void matmul_task(void *params)
-{
-    const TickType_t xDelay = 1 / portTICK_PERIOD_MS;
+void matmul_task(void *params) {
     MatMulTaskParams *p = (MatMulTaskParams *)params;
-    TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
-    char *tName = pcTaskGetName(current_task);
-    // ESP_LOGI(TAG, "Created Task %s", tName);
-    for (;;)
-    {
-        if (xSemaphoreTake(semaDataReady, portMAX_DELAY) == pdTRUE)
-        {
-            //   ESP_LOGI(TAG, "Started Task %s", tName);
-            for (int i = p->start; i < p->end; i++)
-            {
+    
+    for (;;) {
+        if (xSemaphoreTake(semaDataReady, portMAX_DELAY) == pdTRUE) {
+            for (int i = p->start; i < p->end; i++) {
                 v4sf val = 0.0f;
-                v4sf *row = &p->w[i * p->n]; // Pointer to the start of the current row in matrix w
+                v4sf *row = &p->w[i * p->n];
                 dsps_dotprod_f32_aes3(row, p->x, &val, p->n);
                 p->xout[i] = val;
             }
-            //    ESP_LOGI(TAG, "Completed task %s", tName);
             xSemaphoreGive(semaDataReady);
             xEventGroupSync(xEventGroup, p->task_num, ALL_SYNC_BITS, portMAX_DELAY);
         }
     }
 }
 
-void forward_task(void *params)
-{
-    const TickType_t xDelay = 1 / portTICK_PERIOD_MS;
+void forward_task(void *params) {
     ForwardTaskParams *t_params = (ForwardTaskParams *)params;
-    TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
-    char *tName = pcTaskGetName(current_task);
-    // ESP_LOGI(TAG, "Created Task %s", tName);
-    for (;;)
-    {
-        if (xSemaphoreTake(semaForwardDataReady, portMAX_DELAY) == pdTRUE)
-        {
-            //   ESP_LOGI(TAG, "Started Task %s", tName);
+    
+    for (;;) {
+        if (xSemaphoreTake(semaForwardDataReady, portMAX_DELAY) == pdTRUE) {
             int h;
-            // #pragma omp parallel for private(h)
-            for (h = t_params->start; h < t_params->end; h++)
-            {
+            for (h = t_params->start; h < t_params->end; h++) {
                 // get the query vector for this head
                 v4sf *q = t_params->s->q + h * t_params->head_size;
                 // attention scores for this head
@@ -376,7 +361,6 @@ void forward_task(void *params)
                     }
                 }
             }
-            //   ESP_LOGI(TAG, "Completed task %s", tName);
             xSemaphoreGive(semaForwardDataReady);
             xEventGroupSync(ForwardEventGroup, t_params->task_num, ALL_FORWARD_TASKS, portMAX_DELAY);
         }
@@ -1055,9 +1039,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         prompt = empty_prompt;
     }
 
-    // encode the (string) prompt into tokens sequence
     int num_prompt_tokens = 0;
-    int *prompt_tokens = (int *)malloc((strlen(prompt) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
+    int *prompt_tokens = (int *)malloc((strlen(prompt) + 3) * sizeof(int));
     encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
     if (num_prompt_tokens < 1)
     {
@@ -1065,52 +1048,101 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         exit(EXIT_FAILURE);
     }
 
-    // start the main loop
-    long start = 0;               // used to time our code, only initialized after first iteration
-    int next;                     // will store the next token in the sequence
-    int token = prompt_tokens[0]; // kick off with the first token in the prompt
-    int pos = 0;                  // position in the sequence
+    long start = 0;               
+    int next;                     
+    int token = prompt_tokens[0]; 
+    int pos = 0;                  
+    int prev_x = -1, prev_y = -1;
+    
+    const int NODE_ACTIVATION_INTERVAL = 5;
+    const int MAX_ACTIVE_NODES = 12;
+    int active_nodes = 0;
+    
+    int tokens_since_last_end = 0;
+    bool in_sentence = false;
+
     while (pos < steps)
     {
-        // forward the transformer to get logits for the next token
         v4sf *logits = forward(transformer, token, pos);
 
-        // advance the state machine
         if (pos < num_prompt_tokens - 1)
         {
-            // if we are still processing the input prompt, force the next prompt token
             next = prompt_tokens[pos + 1];
         }
         else
         {
-            // otherwise sample the next token from the logits
             next = sample(sampler, logits);
         }
         pos++;
+        tokens_since_last_end++;
 
-        // data-dependent terminating condition: the BOS (=1) token delimits sequences
-        if (next == 1)
-        {
-            break;
+        char *piece = decode(tokenizer, token, next);
+        
+        if (piece && piece[0] != '\0') {
+            // Controlla la fine della frase
+            if (piece[0] == '.' || piece[0] == '!' || piece[0] == '?') {
+                tokens_since_last_end = 0;
+                in_sentence = false;
+            } else {
+                // Controlla se non è uno spazio usando il cast esplicito a unsigned char
+                if (!isspace((unsigned char)piece[0])) {
+                    in_sentence = true;
+                }
+            }
         }
 
-        // print the token as string, decode it with the Tokenizer object
-        char *piece = decode(tokenizer, token, next);
-        safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+        // LED Matrix logic
+        if (pos % NODE_ACTIVATION_INTERVAL == 0 && active_nodes < MAX_ACTIVE_NODES) {
+            unsigned int hash = (unsigned int)next;
+            hash = (hash ^ 61) ^ (hash >> 16);
+            hash = hash + (hash << 3);
+            hash = hash ^ (hash >> 4);
+            hash = hash * 0x27d4eb2d;
+            
+            int base_x = (hash >> 16) % MATRIX_COLS;
+            int base_y = (hash & 0xFFFF) % MATRIX_ROWS;
+            
+            int x, y;
+            if (prev_x != -1 && prev_y != -1) {
+                x = prev_x + (base_x % 5 - 2);
+                y = prev_y + (base_y % 5 - 2);
+                x = (x + MATRIX_COLS) % MATRIX_COLS;
+                y = (y + MATRIX_ROWS) % MATRIX_ROWS;
+            } else {
+                x = base_x;
+                y = base_y;
+            }
+
+            int *coords = malloc(2 * sizeof(int));
+            if (coords != NULL) {
+                coords[0] = x;
+                coords[1] = y;
+                xTaskCreate(activate_new_node_task, "activate_node", 2048, coords, 5, NULL);
+                active_nodes++;
+                prev_x = x;
+                prev_y = y;
+            }
+        }
+
+        safe_printf(piece);
         fflush(stdout);
         token = next;
 
-        // init the timer here because the first iteration can be slower
-        if (start == 0)
-        {
+        if (start == 0) {
             start = time_in_ms();
         }
+
+        if (pos > steps * 0.8 && !in_sentence) {
+            break;
+        }
+    }
+
+    if (in_sentence) {
+        printf(".");
     }
     printf("\n");
 
-    // report achieved tok/s (pos-1 because the timer starts after first iteration)
-    if (pos > 1)
-    {
+    if (pos > 1) {
         long end = time_in_ms();
         float tks = (pos - 1) / (double)(end - start) * 1000;
         fprintf(stderr, "achieved tok/s: %f\n", tks);
@@ -1118,7 +1150,6 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     }
 
     free(prompt_tokens);
-    ESP_LOGI(TAG, "Generate complete");
 }
 
 void read_stdin(const char *guide, char *buffer, size_t bufsize)

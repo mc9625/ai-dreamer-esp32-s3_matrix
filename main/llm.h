@@ -15,6 +15,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "ws_matrix.h"
 
 typedef float v4sf __attribute__((aligned(16)));
 
