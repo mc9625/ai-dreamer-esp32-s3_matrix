@@ -19,6 +19,10 @@
 #define FADE_DELAY_MS 30
 #define NORMAL_BRIGHTNESS 60
 
+#define FADE_MAX_INTENSITY 255  
+#define FLASH_INTENSITY 255    
+#define FLASH_DURATION_MS 100 
+
 typedef struct {
     uint8_t r;
     uint8_t g;

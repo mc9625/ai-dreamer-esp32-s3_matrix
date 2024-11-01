@@ -33,8 +33,6 @@
 #define ALL_SYNC_BITS (TASK_0_BIT | TASK_1_BIT)
 #define ALL_FORWARD_TASKS (FORWARD_TASK_1 | FORWARD_TASK_2)
 
-
-#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #include "esp_log.h"
 
 typedef struct
@@ -298,30 +296,48 @@ void softmax(v4sf *x, int size)
     }
 }
 
-void matmul_task(void *params) {
+void matmul_task(void *params)
+{
+    const TickType_t xDelay = 1 / portTICK_PERIOD_MS;
     MatMulTaskParams *p = (MatMulTaskParams *)params;
-    
-    for (;;) {
-        if (xSemaphoreTake(semaDataReady, portMAX_DELAY) == pdTRUE) {
-            for (int i = p->start; i < p->end; i++) {
+    TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
+    char *tName = pcTaskGetName(current_task);
+    // ESP_LOGI(TAG, "Created Task %s", tName);
+    for (;;)
+    {
+        if (xSemaphoreTake(semaDataReady, portMAX_DELAY) == pdTRUE)
+        {
+            //   ESP_LOGI(TAG, "Started Task %s", tName);
+            for (int i = p->start; i < p->end; i++)
+            {
                 v4sf val = 0.0f;
-                v4sf *row = &p->w[i * p->n];
+                v4sf *row = &p->w[i * p->n]; // Pointer to the start of the current row in matrix w
                 dsps_dotprod_f32_aes3(row, p->x, &val, p->n);
                 p->xout[i] = val;
             }
+            //    ESP_LOGI(TAG, "Completed task %s", tName);
             xSemaphoreGive(semaDataReady);
             xEventGroupSync(xEventGroup, p->task_num, ALL_SYNC_BITS, portMAX_DELAY);
         }
     }
 }
 
-void forward_task(void *params) {
+void forward_task(void *params)
+{
+    const TickType_t xDelay = 1 / portTICK_PERIOD_MS;
     ForwardTaskParams *t_params = (ForwardTaskParams *)params;
-    
-    for (;;) {
-        if (xSemaphoreTake(semaForwardDataReady, portMAX_DELAY) == pdTRUE) {
+    TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
+    char *tName = pcTaskGetName(current_task);
+    // ESP_LOGI(TAG, "Created Task %s", tName);
+    for (;;)
+    {
+        if (xSemaphoreTake(semaForwardDataReady, portMAX_DELAY) == pdTRUE)
+        {
+            //   ESP_LOGI(TAG, "Started Task %s", tName);
             int h;
-            for (h = t_params->start; h < t_params->end; h++) {
+            // #pragma omp parallel for private(h)
+            for (h = t_params->start; h < t_params->end; h++)
+            {
                 // get the query vector for this head
                 v4sf *q = t_params->s->q + h * t_params->head_size;
                 // attention scores for this head
@@ -361,6 +377,7 @@ void forward_task(void *params) {
                     }
                 }
             }
+            //   ESP_LOGI(TAG, "Completed task %s", tName);
             xSemaphoreGive(semaForwardDataReady);
             xEventGroupSync(ForwardEventGroup, t_params->task_num, ALL_FORWARD_TASKS, portMAX_DELAY);
         }
@@ -1027,6 +1044,7 @@ long time_in_ms()
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
+
 // ----------------------------------------------------------------------------
 // generation loop
 
@@ -1054,8 +1072,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     int pos = 0;                  
     int prev_x = -1, prev_y = -1;
     
-    const int NODE_ACTIVATION_INTERVAL = 5;
-    const int MAX_ACTIVE_NODES = 12;
+    const int NODE_ACTIVATION_INTERVAL = 7;
+    const int MAX_ACTIVE_NODES = 22;
     int active_nodes = 0;
     
     int tokens_since_last_end = 0;

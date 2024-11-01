@@ -114,50 +114,39 @@ void matrix_set_brightness(uint8_t new_brightness) {
     brightness = (new_brightness > MAX_BRIGHTNESS) ? MAX_BRIGHTNESS : new_brightness;
 }
 
+static rgb_color_t dim_color(rgb_color_t color, uint8_t intensity) {
+    rgb_color_t dimmed;
+    dimmed.r = (color.r * intensity) / FADE_MAX_INTENSITY;
+    dimmed.g = (color.g * intensity) / FADE_MAX_INTENSITY;
+    dimmed.b = (color.b * intensity) / FADE_MAX_INTENSITY;
+    return dimmed;
+}
+
 void fade_in_single_pixel(uint8_t x, uint8_t y, rgb_color_t color) {
-    // Determine target brightness based on current brightness
-    uint8_t current_brightness = node_active[y][x] ? NORMAL_BRIGHTNESS + ((total_active_nodes % 3) + 1) * 20 : 0;
-    uint8_t target_brightness;
-    
-    if (current_brightness == 0) {
-        target_brightness = NORMAL_BRIGHTNESS;
-    } else if (current_brightness < MAX_BRIGHTNESS) {
-        target_brightness = current_brightness + 20;
-        if (target_brightness > MAX_BRIGHTNESS) {
-            target_brightness = MAX_BRIGHTNESS;
-        }
-    } else {
-        target_brightness = MAX_BRIGHTNESS;
-    }
-
-    // Fade in from current brightness
-    rgb_color_t temp_color;
-    for (int i = 0; i <= FADE_STEPS; i++) {
-        uint8_t current = current_brightness + 
-            ((target_brightness - current_brightness) * i) / FADE_STEPS;
-
-        temp_color.r = 0;
-        temp_color.g = 0;
-        temp_color.b = current;
-
-        matrix_set_pixel(x, y, temp_color);
+    // Prima fase: Fade in graduale
+    for (int step = 0; step <= FADE_STEPS; step++) {
+        int intensity = (step * FADE_MAX_INTENSITY) / FADE_STEPS;
+        rgb_color_t dimmed = dim_color(color, intensity);
+        matrix_set_pixel(x, y, dimmed);
         matrix_show();
         vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS));
     }
 
-    // Flash white
-    matrix_set_pixel(x, y, (rgb_color_t){255, 255, 255});
+    // Seconda fase: Flash bianco
+    rgb_color_t white = {
+        .r = FLASH_INTENSITY,
+        .g = FLASH_INTENSITY,
+        .b = FLASH_INTENSITY
+    };
+    matrix_set_pixel(x, y, white);
     matrix_show();
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(FLASH_DURATION_MS));
 
-    // Return to final color
-    temp_color.r = 0;
-    temp_color.g = 0;
-    temp_color.b = target_brightness;
-    matrix_set_pixel(x, y, temp_color);
+    // Fase finale: Torna al colore target
+    matrix_set_pixel(x, y, color);
     matrix_show();
 
-    // Update node state
+    // Aggiorna lo stato del nodo
     if (!node_active[y][x]) {
         node_active[y][x] = true;
         total_active_nodes++;
@@ -168,10 +157,10 @@ void test_matrix(void) {
     ESP_LOGI(TAG, "Starting matrix test");
     
     // Adjusted Google colors
-    rgb_color_t google_blue = {.r = 10, .g = 50, .b = 255};
-    rgb_color_t google_red = {.r = 255, .g = 30, .b = 30};
+    rgb_color_t google_blue = {.r = 0, .g = 0, .b = 255};
+    rgb_color_t google_red = {.r = 255, .g = 0, .b = 0};
     rgb_color_t google_yellow = {.r = 255, .g = 180, .b = 0};
-    rgb_color_t google_green = {.r = 30, .g = 255, .b = 30};
+    rgb_color_t google_green = {.r = 0, .g = 255, .b = 0};
     
     matrix_clear();
     vTaskDelay(pdMS_TO_TICKS(500));
