@@ -188,7 +188,7 @@ void app_main(void) {
     char *checkpoint_path = "/data/aidreams260K.bin";
     char *tokenizer_path = "/data/tok512.bin";
     float temperature = 0.8f;
-    float topp = 0.3f;
+    float topp = 0.9f;
     int steps = 512;
     unsigned long long rng_seed = get_random_seed();
 

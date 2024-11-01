@@ -33,6 +33,8 @@
 #define ALL_SYNC_BITS (TASK_0_BIT | TASK_1_BIT)
 #define ALL_FORWARD_TASKS (FORWARD_TASK_1 | FORWARD_TASK_2)
 
+
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #include "esp_log.h"
 
 typedef struct
@@ -301,7 +303,7 @@ void matmul_task(void *params)
     const TickType_t xDelay = 1 / portTICK_PERIOD_MS;
     MatMulTaskParams *p = (MatMulTaskParams *)params;
     TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
-    char *tName = pcTaskGetName(current_task);
+    //char *tName = pcTaskGetName(current_task);
     // ESP_LOGI(TAG, "Created Task %s", tName);
     for (;;)
     {
@@ -327,7 +329,7 @@ void forward_task(void *params)
     const TickType_t xDelay = 1 / portTICK_PERIOD_MS;
     ForwardTaskParams *t_params = (ForwardTaskParams *)params;
     TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
-    char *tName = pcTaskGetName(current_task);
+    //char *tName = pcTaskGetName(current_task);
     // ESP_LOGI(TAG, "Created Task %s", tName);
     for (;;)
     {
@@ -1072,8 +1074,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     int pos = 0;                  
     int prev_x = -1, prev_y = -1;
     
-    const int NODE_ACTIVATION_INTERVAL = 7;
-    const int MAX_ACTIVE_NODES = 22;
+    const int NODE_ACTIVATION_INTERVAL = 5;
+    const int MAX_ACTIVE_NODES = 40;
     int active_nodes = 0;
     
     int tokens_since_last_end = 0;
