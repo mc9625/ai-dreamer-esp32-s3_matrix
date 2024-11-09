@@ -4,8 +4,10 @@
 #include "esp_http_server.h"
 #include "esp_mac.h"
 #include "captive_portal.h"
-#include "esp_log.h" 
-
+#include "esp_log.h"
+#include "lwip/apps/netbiosns.h"
+#include "esp_netif_types.h"
+#include "esp_netif.h"
 
 static const char *TAG = "CAPTIVE_PORTAL";
 
@@ -14,171 +16,169 @@ char llm_output_buffer[MAX_LLM_OUTPUT] = {0};
 size_t llm_output_len = 0;
 static httpd_handle_t server = NULL;
 
-// DNS query handler// DNS query handler
-static void dns_query_handler(const char *name, ip_addr_t *addr) {
-    addr->u_addr.ip4.addr = ipaddr_addr("192.168.4.1");
-    ESP_LOGI(TAG, "DNS Query for %s -> redirecting to captive portal", name);
+// Configure DHCP with Apple's requirements
+static esp_err_t configure_dhcp(esp_netif_t *netif) {
+    ESP_LOGI(TAG, "Configuring DHCP server...");
+    
+    // Stop DHCP server temporarily
+    ESP_ERROR_CHECK(esp_netif_dhcps_stop(netif));
+    
+    // Set DNS server address
+    esp_netif_dns_info_t dns_info = {
+        .ip.u_addr.ip4.addr = esp_netif_ip4_makeu32(192, 168, 4, 1)
+    };
+    dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+    ESP_ERROR_CHECK(esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns_info));
+
+    // Enable DNS option
+    esp_netif_dhcp_option_mode_t opt_mode = ESP_NETIF_OP_SET;
+    esp_netif_dhcp_option_id_t opt_id = ESP_NETIF_DOMAIN_NAME_SERVER;
+    uint8_t enable = 1;
+    ESP_ERROR_CHECK(esp_netif_dhcps_option(netif, opt_mode, opt_id, &enable, sizeof(enable)));
+    
+    // Set Option 114 (Captive Portal URL) using the correct identifier
+    const char *captive_url = "http://192.168.4.1/portal";
+    ESP_ERROR_CHECK(esp_netif_dhcps_option(netif, opt_mode, ESP_NETIF_CAPTIVEPORTAL_URI, 
+                                          (void*)captive_url, strlen(captive_url)));
+    
+    // Configure IP range
+    esp_netif_ip_info_t ip_info = {
+        .ip.addr = esp_netif_ip4_makeu32(192, 168, 4, 1),
+        .netmask.addr = esp_netif_ip4_makeu32(255, 255, 255, 0),
+        .gw.addr = esp_netif_ip4_makeu32(192, 168, 4, 1)
+    };
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(netif, &ip_info));
+    
+    // Start DHCP server with new configuration
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(netif));
+    
+    ESP_LOGI(TAG, "DHCP server configured successfully");
+    return ESP_OK;
 }
 
-static void init_dns_redirect(void)
-{
-    ip_addr_t resolve_ip;
-    resolve_ip.type = IPADDR_TYPE_V4;
-    resolve_ip.u_addr.ip4.addr = ipaddr_addr("192.168.4.1");
-    
-    // Configura il DNS server per reindirizzare tutte le richieste al nostro IP
-    dns_setserver(0, &resolve_ip);
-    
-    // Aggiungi più indirizzi DNS per intercettare tutte le richieste
-    const ip_addr_t *dns_ip = dns_getserver(0);
-    dns_init();
-    
-    ESP_LOGI(TAG, "DNS server configured at " IPSTR, IP2STR(&dns_ip->u_addr.ip4));
+// Function to check if a request is from Apple CNA
+static bool is_captive_portal_check(httpd_req_t *req) {
+    const char *uri = req->uri;
+    return (strstr(uri, "/hotspot-detect.html") != NULL ||
+            strstr(uri, "/generate_204") != NULL ||
+            strstr(uri, "/connecttest.txt") != NULL ||
+            strstr(uri, "/redirect") != NULL ||
+            strstr(uri, "/success.txt") != NULL ||
+            strstr(uri, "/ncsi.txt") != NULL ||
+            strstr(uri, "/fwlink/") != NULL);
 }
 
-// HTML template
-static const char* HTML_TEMPLATE = R"(
-<!DOCTYPE html>
-<html>
-<head>
-    <title>ESP32 LLM Output</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }
-        .container { max-width: 800px; margin: 0 auto; background: #f9f9f9; padding: 20px; border-radius: 8px; }
-        pre { white-space: pre-wrap; word-wrap: break-word; background: #fff; padding: 15px; border-radius: 4px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>ESP32 LLM Output</h1>
-        <pre>%s</pre>
-    </div>
-</body>
-</html>
-)";
-
-// HTTP handlers
+// Root handler for all requests
 static esp_err_t root_handler(httpd_req_t *req) {
-    // Controlla se è una richiesta di verifica captive portal
-    if (strstr(req->uri, "/hotspot-detect.html") != NULL ||
-        strstr(req->uri, "/generate_204") != NULL ||
-        strstr(req->uri, "/connecttest.txt") != NULL ||
-        strstr(req->uri, "/redirect") != NULL ||
-        strstr(req->uri, "/success.txt") != NULL) {
+    ESP_LOGI(TAG, "Received request for URI: %s", req->uri);
+    
+    // Check user agent for Apple devices
+    char *user_agent = NULL;
+    size_t ua_len = httpd_req_get_hdr_value_len(req, "User-Agent");
+    if (ua_len > 0) {
+        user_agent = malloc(ua_len + 1);
+        if (user_agent) {
+            httpd_req_get_hdr_value_str(req, "User-Agent", user_agent, ua_len + 1);
+            ESP_LOGI(TAG, "User Agent: %s", user_agent);
+        }
+    }
+
+    // Special handling for Apple CNA requests
+    if (is_captive_portal_check(req)) {
+        ESP_LOGI(TAG, "Captive portal check detected");
         
+        // For Apple devices, return a 200 OK with specific content
+        if (user_agent && strstr(user_agent, "CaptiveNetworkSupport")) {
+            free(user_agent);
+            httpd_resp_set_status(req, "200 OK");
+            httpd_resp_set_type(req, "text/html");
+            const char *success_response = "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>";
+            httpd_resp_send(req, success_response, strlen(success_response));
+            return ESP_OK;
+        }
+        
+        free(user_agent);
+        // For other devices, redirect to portal
         httpd_resp_set_status(req, "302 Found");
         httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/portal");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
         httpd_resp_send(req, NULL, 0);
         return ESP_OK;
     }
 
-    // Pagina principale con l'output dell'LLM
-    const char* html_start = 
-        "<html><head>"
+    free(user_agent);
+
+    // For all other requests, serve the main page
+    const char* html_template = 
+        "<!DOCTYPE html>"
+        "<html>"
+        "<head>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>AI Dreamer Output</title>"
         "<style>"
-        "body{font-family:Arial,sans-serif;margin:20px;line-height:1.6;}"
-        ".container{max-width:800px;margin:0 auto;background:#f9f9f9;padding:20px;border-radius:8px;}"
-        "pre{white-space:pre-wrap;word-wrap:break-word;background:#fff;padding:15px;border-radius:4px;}"
-        "</style></head><body><div class='container'><h1>AI Dreamer Output</h1><pre>";
-    
-    const char* html_end = "</pre></div></body></html>";
+        "body{font-family:Arial,sans-serif;margin:20px;line-height:1.6;background:#f0f0f0;}"
+        ".container{max-width:800px;margin:0 auto;background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}"
+        "pre{white-space:pre-wrap;word-wrap:break-word;background:#f9f9f9;padding:15px;border-radius:4px;border:1px solid #ddd;}"
+        "h1{color:#333;text-align:center;}"
+        "</style>"
+        "</head>"
+        "<body>"
+        "<div class='container'>"
+        "<h1>AI Dreamer Output</h1>"
+        "<pre>%s</pre>"
+        "</div>"
+        "</body>"
+        "</html>";
 
+    char *response = malloc(strlen(html_template) + strlen(llm_output_buffer) + 1);
+    if (response == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for response");
+        return ESP_ERR_NO_MEM;
+    }
+
+    sprintf(response, html_template, llm_output_buffer);
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send_chunk(req, html_start, strlen(html_start));
-    httpd_resp_send_chunk(req, llm_output_buffer, strlen(llm_output_buffer));
-    httpd_resp_send_chunk(req, html_end, strlen(html_end));
-    httpd_resp_send_chunk(req, NULL, 0);
-    
-    return ESP_OK;
-}
-
-
-static esp_err_t apple_captive_handler(httpd_req_t *req) {
-    const char *response = "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>";
-    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_send(req, response, strlen(response));
+    free(response);
+    
     return ESP_OK;
 }
 
-// Initialize HTTP server
-static esp_err_t start_webserver(void)
-{
-    if (server != NULL) {
-        ESP_LOGW(TAG, "Web server already started");
-        return ESP_OK;
-    }
-    
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 4;
-    config.stack_size = 8192;
-    
-    esp_err_t ret = httpd_start(&server, &config);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start web server (error %d)", ret);
-        return ret;
-    }
-
-    httpd_uri_t root = {
-        .uri = "/",
-        .method = HTTP_GET,
-        .handler = root_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(server, &root);
-
-    httpd_uri_t captive = {
-        .uri = "/hotspot-detect.html",
-        .method = HTTP_GET,
-        .handler = apple_captive_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(server, &captive);
-
-    return ESP_OK;
-}
-
-// Initialize DNS server
-static void start_dns_server(void) {
-    ip_addr_t resolve_ip;
-    IP_ADDR4(&resolve_ip, 192, 168, 4, 1);
-    
-    dns_init();
-    dns_setserver(0, &resolve_ip);
-    ESP_LOGI(TAG, "DNS server initialized");
-}
-
-// Public functions
-esp_err_t captive_portal_init(void)
-{
+esp_err_t captive_portal_init(esp_netif_t *ap_netif) {
     ESP_LOGI(TAG, "Initializing captive portal");
 
-    // Inizializza il reindirizzamento DNS
-    init_dns_redirect();
-    
-    // Configura il server web
+    // Configure DNS
+    ip_addr_t dns_addr;
+    dns_addr.type = IPADDR_TYPE_V4;
+    dns_addr.u_addr.ip4.addr = esp_netif_htonl(esp_netif_ip4_makeu32(192, 168, 4, 1));
+    dns_setserver(0, &dns_addr);
+
+    // Start NetBIOS
+    netbiosns_init();
+    netbiosns_set_name("espressif");
+
+    // Configure and start HTTP server
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 8;
     config.stack_size = 8192;
+    config.uri_match_fn = httpd_uri_match_wildcard;
     config.lru_purge_enable = true;
-    config.core_id = 0;  // Esegui sul core 0
-    
-    httpd_handle_t server = NULL;
+
     esp_err_t ret = httpd_start(&server, &config);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start web server");
+        ESP_LOGE(TAG, "Failed to start HTTP server");
         return ret;
     }
 
-    // Registra i gestori URI
-    httpd_uri_t root = {
+    // Register URI handler for all paths
+    httpd_uri_t uri_catch_all = {
         .uri = "/*",
         .method = HTTP_GET,
         .handler = root_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(server, &root);
+    httpd_register_uri_handler(server, &uri_catch_all);
 
     ESP_LOGI(TAG, "Captive portal initialized successfully");
     return ESP_OK;

@@ -10,6 +10,11 @@
 #include "llm.h"
 #include "ws_matrix.h"
 #include "captive_portal.h"
+#include "esp_mac.h"
+#include "dhcpserver/dhcpserver.h"
+#include "esp_netif_types.h"
+#include "lwip/dns.h"
+#include "lwip/tcpip.h"
 
 // Constants
 #define MIN_INITIAL_NODES 20
@@ -102,41 +107,72 @@ static esp_err_t init_storage(void)
 // WiFi initialization
 static esp_err_t init_wifi(void)
 {
+    ESP_LOGI(TAG, "Initializing WiFi in AP mode...");
+
+    // Initialize TCP/IP network interface
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    cfg.static_rx_buf_num = 3;
-    cfg.dynamic_rx_buf_num = 8;
-    cfg.static_tx_buf_num = 6;
-    cfg.cache_tx_buf_num = 0;
-    cfg.wifi_task_core_id = 0;
+    // Create default AP
+    wifi_netif = esp_netif_create_default_wifi_ap();
 
+    // Configure static IP
+    esp_netif_ip_info_t ip_info = {0};
+    IP4_ADDR(&ip_info.ip, 192, 168, 4, 1);
+    IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);
+    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+    
+    // Stop DHCP server, set IP info, restart DHCP server
+    ESP_ERROR_CHECK(esp_netif_dhcps_stop(wifi_netif));
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(wifi_netif, &ip_info));
+
+    // Configure DNS
+    esp_netif_dns_info_t dns_info = {0};
+    dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+    dns_info.ip.u_addr.ip4.addr = ip_info.ip.addr; // Same as AP IP
+    ESP_ERROR_CHECK(esp_netif_set_dns_info(wifi_netif, ESP_NETIF_DNS_MAIN, &dns_info));
+
+    // Configure DHCP basic options
+    esp_netif_dhcp_option_mode_t opt_mode = ESP_NETIF_OP_SET;
+    esp_netif_dhcp_option_id_t opt_id = ESP_NETIF_DOMAIN_NAME_SERVER;
+    uint8_t dns_enable = 1;
+    ESP_ERROR_CHECK(esp_netif_dhcps_option(wifi_netif, opt_mode, opt_id, &dns_enable, sizeof(dns_enable)));
+
+    // Configure WiFi
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    
+    // Register event handler
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                       ESP_EVENT_ANY_ID,
                                                       &wifi_event_handler,
                                                       NULL,
                                                       NULL));
 
-    wifi_netif = esp_netif_create_default_wifi_ap();
-
+    // Configure AP
     wifi_config_t wifi_config = {
         .ap = {
             .ssid = "ESP32-AI-DREAMER",
             .ssid_len = strlen("ESP32-AI-DREAMER"),
             .channel = 1,
             .password = "",
-            .max_connection = 1,
-            .authmode = WIFI_AUTH_OPEN
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_OPEN,
+            .pmf_cfg = {
+                .required = false
+            },
         },
     };
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
 
+    // Start WiFi and DHCP server
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(wifi_netif));
+
+    ESP_LOGI(TAG, "WiFi AP started with IP: 192.168.4.1");
     return ESP_OK;
 }
 
@@ -308,5 +344,5 @@ void app_main(void)
     // Initialize WiFi and captive portal
     ESP_ERROR_CHECK(init_wifi());
     vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_ERROR_CHECK(captive_portal_init());
+    ESP_ERROR_CHECK(captive_portal_init(wifi_netif));
 }
