@@ -270,9 +270,10 @@ void app_main(void)
     
     char *checkpoint_path = "/data/aidreams260K.bin";
     char *tokenizer_path = "/data/tok512.bin";
+    // better value to use: temperature=0.7f, topp=0.8f, steps=640
     float temperature = 0.7f;
     float topp = 0.8f;
-    int steps = 640;
+    int steps = 1024;
 
     ESP_LOGI(TAG, "Loading model from %s", checkpoint_path);
     build_transformer(transformer, checkpoint_path);

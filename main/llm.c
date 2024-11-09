@@ -690,6 +690,17 @@ void safe_printf(char *piece) {
     if (piece == NULL || piece[0] == '\0') {
         return;
     }
+
+    // Ignore the initial " if it's the first character
+    if (output_pos == 0 && piece[0] == '"') {
+        piece++;  // Sposta il puntatore al prossimo carattere
+    }
+
+    // Ignore special tokens "<s>" and "</s>"
+    if (strcmp(piece, "<s>") == 0 || strcmp(piece, "</s>") == 0) {
+        return;
+    }
+
     
     if (piece[1] == '\0') {
         unsigned char byte_val = piece[0];
@@ -697,7 +708,7 @@ void safe_printf(char *piece) {
             return;
         }
     }
-    
+
     // Salva nel buffer e stampa
     size_t len = strlen(piece);
     if (output_pos + len < sizeof(output_buffer) - 1) {
@@ -705,7 +716,7 @@ void safe_printf(char *piece) {
         output_pos += len;
         output_buffer[output_pos] = '\0';
     }
-    
+
     printf("%s", piece);
 }
 
