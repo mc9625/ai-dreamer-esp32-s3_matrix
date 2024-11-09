@@ -33,6 +33,8 @@
 #define ALL_SYNC_BITS (TASK_0_BIT | TASK_1_BIT)
 #define ALL_FORWARD_TASKS (FORWARD_TASK_1 | FORWARD_TASK_2)
 
+#define DISABLE_DSP_OPTIMIZATIONS
+
 
 #define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #include "esp_log.h"
@@ -899,62 +901,99 @@ int compare(const void *a, const void *b)
 
 int sample_topp(v4sf *probabilities, int n, v4sf topp, ProbIndex *probindex, v4sf coin)
 {
-    // top-p sampling (or "nucleus sampling") samples from the smallest set of
-    // tokens that exceed probability topp. This way we never sample tokens that
-    // have very low probabilities and are less likely to go "off the rails".
-    // coin is a random number in [0, 1), usually from random_f32()
+    // Controlli iniziali
+    if (!probabilities || !probindex || n <= 0) {
+        ESP_LOGE(TAG, "Invalid parameters");
+        return 0;
+    }
 
+    // Allocazione temporanea in stack per sicurezza
+    ProbIndex local_buffer[512];  // Assumiamo vocab_size <= 512
     int n0 = 0;
-    // quicksort indices in descending order of probabilities
-    // values smaller than (1 - topp) / (n - 1) cannot be part of the result
-    // so for efficiency we crop these out as candidates before sorting
-    const v4sf cutoff = (1.0f - topp) / (n - 1);
-    for (int i = 0; i < n; i++)
-    {
-        if (probabilities[i] >= cutoff)
-        {
-            probindex[n0].index = i;
-            probindex[n0].prob = probabilities[i];
+    float cutoff = (float)(1.0f - topp) / (float)(n - 1);
+
+    // Prima fase: raccolta candidati con controlli di bounds
+    for (int i = 0; i < n && n0 < 512; i++) {
+        float prob = (float)probabilities[i];
+        if (prob >= cutoff) {
+            local_buffer[n0].index = i;
+            local_buffer[n0].prob = prob;
             n0++;
         }
     }
-    qsort(probindex, n0, sizeof(ProbIndex), compare);
 
-    // truncate the list where cumulative probability exceeds topp
-    v4sf cumulative_prob = 0.0f;
-    int last_idx = n0 - 1; // in case of rounding errors consider all elements
-    for (int i = 0; i < n0; i++)
-    {
-        cumulative_prob += probindex[i].prob;
-        if (cumulative_prob > topp)
-        {
+    // Controllo se abbiamo candidati
+    if (n0 == 0) {
+        ESP_LOGW(TAG, "No candidates, using argmax");
+        int max_idx = 0;
+        float max_prob = probabilities[0];
+        for (int i = 1; i < n; i++) {
+            if (probabilities[i] > max_prob) {
+                max_prob = probabilities[i];
+                max_idx = i;
+            }
+        }
+        return max_idx;
+    }
+
+    // Sort dei candidati in local_buffer
+    for (int i = 0; i < n0 - 1; i++) {
+        for (int j = 0; j < n0 - i - 1; j++) {
+            if (local_buffer[j].prob < local_buffer[j + 1].prob) {
+                ProbIndex temp = local_buffer[j];
+                local_buffer[j] = local_buffer[j + 1];
+                local_buffer[j + 1] = temp;
+            }
+        }
+    }
+
+    // Calcolo probabilità cumulativa e troncamento
+    float cumsum = 0.0f;
+    int last_idx = 0;
+    
+    for (int i = 0; i < n0; i++) {
+        cumsum += local_buffer[i].prob;
+        if (cumsum >= topp) {
             last_idx = i;
-            break; // we've exceeded topp by including last_idx
+            break;
         }
     }
 
-    // sample from the truncated list
-    v4sf r = coin * cumulative_prob;
-    v4sf cdf = 0.0f;
-    for (int i = 0; i <= last_idx; i++)
-    {
-        cdf += probindex[i].prob;
-        if (r < cdf)
-        {
-            return probindex[i].index;
+    // Sampling finale con controlli di sicurezza
+    float r = (float)coin * cumsum;
+    float current_sum = 0.0f;
+
+    for (int i = 0; i <= last_idx; i++) {
+        current_sum += local_buffer[i].prob;
+        if (r <= current_sum && local_buffer[i].index >= 0 && local_buffer[i].index < n) {
+            return local_buffer[i].index;
         }
     }
-    return probindex[last_idx].index; // in case of rounding errors
+
+    // Fallback sicuro
+    return local_buffer[0].index;
 }
 void build_sampler(Sampler *sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
     sampler->vocab_size = vocab_size;
-    ESP_LOGI(TAG, "Building sampler with temperature: %f, topp: %f", temperature, topp);
-    sampler->temperature = temperature;  // il tipo di sampler->temperature deve essere float, non v4sf
-    sampler->topp = topp;               // il tipo di sampler->topp deve essere float, non v4sf
+    sampler->temperature = temperature;
+    sampler->topp = topp;
     sampler->rng_state = rng_seed;
-    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
-    ESP_LOGI(TAG, "Sampler built with temperature: %f, topp: %f", 
-             sampler->temperature, sampler->topp);
+    
+    ESP_LOGI(TAG, "Building sampler with temperature: %f, topp: %f", temperature, topp);
+    
+    // Allocazione semplice
+    sampler->probindex = heap_caps_malloc(vocab_size * sizeof(ProbIndex), 
+                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    
+    if (!sampler->probindex) {
+        ESP_LOGE(TAG, "Failed to allocate probindex");
+        abort();
+    }
+
+    // Inizializzazione a zero
+    memset(sampler->probindex, 0, vocab_size * sizeof(ProbIndex));
+    
+    ESP_LOGI(TAG, "Sampler built with temperature: %f, topp: %f", temperature, topp);
 }
 
 void free_sampler(Sampler *sampler)
