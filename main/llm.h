@@ -92,6 +92,7 @@ typedef struct {
     // kv cache
     v4sf* key_cache;   // (layer, seq_len, dim)
     v4sf* value_cache; // (layer, seq_len, dim)
+    unsigned long long rng_state;
 } RunState;
 
 

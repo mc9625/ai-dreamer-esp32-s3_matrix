@@ -20,6 +20,7 @@
 #include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "captive_portal.h"
 
 #define MAP_FAILED NULL
 #define munmap(ptr, length) custom_munmap(ptr)
@@ -35,8 +36,11 @@
 
 #define DISABLE_DSP_OPTIMIZATIONS
 
+static char output_buffer[MAX_LLM_OUTPUT] = {0};
+static size_t output_pos = 0;
 
-#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
+v4sf random_f32(unsigned long long *state);
+
 #include "esp_log.h"
 
 typedef struct
@@ -435,6 +439,10 @@ v4sf *forward(Transformer *transformer, int token, int pos)
     ESP_LOGD(TAG, "Content row: %f", *content_row);
     memcpy(x, content_row, dim * sizeof(*x));
 
+    for (int i = 0; i < dim; i++) {
+        x[i] += random_f32(&transformer->state.rng_state) * 0.01f;
+    }
+
     // forward all the layers
     for (unsigned long long l = 0; l < p->n_layers; l++)
     {
@@ -678,28 +686,29 @@ char *decode(Tokenizer *t, int prev_token, int token)
     return piece;
 }
 
-void safe_printf(char *piece)
-{
-    // piece might be a raw byte token, and we only want to print printable chars or whitespace
-    // because some of the other bytes can be various control codes, backspace, etc.
-    if (piece == NULL)
-    {
+void safe_printf(char *piece) {
+    if (piece == NULL || piece[0] == '\0') {
         return;
     }
-    if (piece[0] == '\0')
-    {
-        return;
-    }
-    if (piece[1] == '\0')
-    {
+    
+    if (piece[1] == '\0') {
         unsigned char byte_val = piece[0];
-        if (!(isprint(byte_val) || isspace(byte_val)))
-        {
-            return; // bad byte, don't print it
+        if (!(isprint(byte_val) || isspace(byte_val))) {
+            return;
         }
     }
+    
+    // Salva nel buffer e stampa
+    size_t len = strlen(piece);
+    if (output_pos + len < sizeof(output_buffer) - 1) {
+        memcpy(output_buffer + output_pos, piece, len);
+        output_pos += len;
+        output_buffer[output_pos] = '\0';
+    }
+    
     printf("%s", piece);
 }
+
 
 int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size)
 {
@@ -977,25 +986,20 @@ void build_sampler(Sampler *sampler, int vocab_size, float temperature, float to
     sampler->vocab_size = vocab_size;
     sampler->temperature = temperature;
     sampler->topp = topp;
-    sampler->rng_state = rng_seed;
-    
-    ESP_LOGI(TAG, "Building sampler with temperature: %f, topp: %f", temperature, topp);
-    
-    // Allocazione semplice
-    sampler->probindex = heap_caps_malloc(vocab_size * sizeof(ProbIndex), 
-                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    
+
+    // Usa un seed casuale unico per ogni generazione, basato sull'orologio interno
+    unsigned long long true_random_seed = (unsigned long long)time(NULL) ^ esp_random();
+    sampler->rng_state = rng_seed ? rng_seed : true_random_seed;
+
+    ESP_LOGI(TAG, "Building sampler with temperature: %f, topp: %f, rng_seed: %llu", temperature, topp, sampler->rng_state);
+
+    // Allocazione della memoria per probindex
+    sampler->probindex = heap_caps_malloc(vocab_size * sizeof(ProbIndex), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!sampler->probindex) {
         ESP_LOGE(TAG, "Failed to allocate probindex");
         abort();
     }
-
-    // Inizializzazione a zero
-    memset(sampler->probindex, 0, vocab_size * sizeof(ProbIndex));
-    
-    ESP_LOGI(TAG, "Sampler built with temperature: %f, topp: %f", temperature, topp);
 }
-
 void free_sampler(Sampler *sampler)
 {
     free(sampler->probindex);
@@ -1016,7 +1020,7 @@ unsigned int random_u32(unsigned long long *state)
     return result;
 }
 v4sf random_f32(unsigned long long *state)
-{ // random v4sf32 in [0,1)
+{
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
@@ -1037,43 +1041,58 @@ void reset_run_state(RunState *s, Config *p) {
 }
 
 int sample(Sampler *sampler, v4sf *logits) {
-    // Existing temperature and topp validation
+    // Validate and apply temperature
     if (sampler->temperature < 0.0f || sampler->temperature > 2.0f) {
         ESP_LOGE(TAG, "Invalid temperature: %f, resetting to 1.0", sampler->temperature);
         sampler->temperature = 1.0f;
     }
-    if (sampler->topp < 0.0f || sampler->topp > 1.0f) {
-        ESP_LOGE(TAG, "Invalid topp: %f, resetting to 0.9", sampler->topp);
-        sampler->topp = 0.9f;
-    }
-    
-    ESP_LOGD(TAG, "Start sampling with rng_state: %llu", sampler->rng_state);
-    int next;
-    if (sampler->temperature == 0.0f) {
-        next = sample_argmax(logits, sampler->vocab_size);
-    } else {
-        // Apply temperature scaling first
+    if (sampler->temperature != 1.0f) {
         for (int q = 0; q < sampler->vocab_size; q++) {
             logits[q] /= sampler->temperature;
         }
-        
-        softmax(logits, sampler->vocab_size);
-        v4sf coin = random_f32(&sampler->rng_state);
-        ESP_LOGD(TAG, "Generated coin: %f", coin);
-        
-        // Always use top-p sampling as it's more stable
-        next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
     }
 
-    // Add basic bounds check
-    if (next < 0 || next >= sampler->vocab_size) {
-        ESP_LOGE(TAG, "Invalid token generated: %d, using fallback", next);
-        next = 0;  // fallback to a safe token
+    for (int i = 0; i < sampler->vocab_size; i++) {
+        logits[i] += (random_f32(&sampler->rng_state) - 0.5f) * 0.2f; 
     }
+    // Apply softmax to logits
+    softmax(logits, sampler->vocab_size);
+
+    // Implement top-p sampling with cumulative probability check
+    float cumulative_prob = 0.0f;
+    int *indices = malloc(sampler->vocab_size * sizeof(int));
+
+    for (int i = 0; i < sampler->vocab_size; i++) {
+        indices[i] = i;
+    }
+
+    // Sort logits by probability
+    for (int i = 0; i < sampler->vocab_size - 1; i++) {
+        for (int j = i + 1; j < sampler->vocab_size; j++) {
+            if (logits[indices[i]] < logits[indices[j]]) {
+                int temp = indices[i];
+                indices[i] = indices[j];
+                indices[j] = temp;
+            }
+        }
+    }
+
+    // Accumulate probabilities and select index
+    int selected_index = -1;
+    for (int i = 0; i < sampler->vocab_size; i++) {
+        int idx = indices[i];
+        cumulative_prob += logits[idx];
+        if (cumulative_prob >= sampler->topp) {
+            selected_index = idx;
+            break;
+        }
+    }
+
+    free(indices);
     
-    ESP_LOGD(TAG, "Selected token: %d", next);
-    return next;
+    return (selected_index != -1) ? selected_index : sample_argmax(logits, sampler->vocab_size);
 }
+
 // ----------------------------------------------------------------------------
 // utilities: time
 
@@ -1089,8 +1108,17 @@ long time_in_ms()
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps, generated_complete_cb cb_done)
-{
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
+             char *prompt, int steps, generated_complete_cb cb_done) {
+    // Reset output buffer
+    output_pos = 0;
+    output_buffer[0] = '\0';
+
+    sampler->rng_state = (unsigned long long)time(NULL) ^ esp_random();
+
+    ESP_LOGI(TAG, "Sampler RNG state reset: %llu", sampler->rng_state);
+
+    
     reset_run_state(&transformer->state, &transformer->config);
     char *empty_prompt = "";
     if (prompt == NULL)
@@ -1122,6 +1150,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
 
     while (pos < steps)
     {
+        sampler->rng_state ^= (unsigned long long)pos * 6364136223846793005ULL + 1;
+
         v4sf *logits = forward(transformer, token, pos);
 
         if (pos < num_prompt_tokens - 1)
@@ -1207,7 +1237,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         fprintf(stderr, "achieved tok/s: %f\n", tks);
         cb_done(tks);
     }
-
+    captive_portal_set_llm_output(output_buffer);
     free(prompt_tokens);
 }
 
