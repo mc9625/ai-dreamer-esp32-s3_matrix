@@ -6,6 +6,8 @@
 #include "driver/gpio.h"
 #include "driver/rmt.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // Matrix configuration
 #define RGB_CONTROL_PIN GPIO_NUM_14
@@ -42,7 +44,7 @@ void matrix_show(void);
 void matrix_clear(void);
 void test_matrix(void);
 void fade_in_single_pixel(uint8_t x, uint8_t y, rgb_color_t color);
-void initialize_matrix_pattern(void);
+void matrix_pattern_task(void *pvParameters);  // Nuovo task separato
 void activate_new_node_task(void *arg);
 
 #endif /* WS_MATRIX_H */

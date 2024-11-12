@@ -101,6 +101,98 @@ void initialize_matrix_pattern(void) {
     }
 }
 
+void matrix_pattern_task(void *pvParameters) {
+    // Aggiungiamo un piccolo delay per permettere alle altre inizializzazioni di completarsi
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    ESP_LOGI(TAG, "Starting matrix pattern initialization");
+    
+    matrix_clear();
+    matrix_show();
+
+    typedef struct {
+        int x;
+        int y;
+        int step;
+        int fade_steps;
+        int delay;
+        bool completed;
+    } AnimNode;
+
+    #define MAX_CONCURRENT_NODES 2
+    #define MAX_NODES_PER_CLUSTER 3
+
+    AnimNode active_nodes[MAX_NODES_PER_CLUSTER * MAX_CONCURRENT_NODES] = {0};
+    int total_nodes = MIN_INITIAL_NODES + (esp_random() % (MAX_INITIAL_NODES - MIN_INITIAL_NODES));
+    int nodes_created = 0;
+    int active_clusters = 0;
+
+    uint8_t current_brightness[MATRIX_COLS][MATRIX_ROWS] = {0};
+
+    while (nodes_created < total_nodes || active_clusters > 0) {
+        if (nodes_created < total_nodes && active_clusters < MAX_CONCURRENT_NODES) {
+            int nodes_in_cluster = 1 + (esp_random() % MAX_NODES_PER_CLUSTER);
+            int base_idx = active_clusters * MAX_NODES_PER_CLUSTER;
+
+            for (int i = 0; i < nodes_in_cluster && nodes_created < total_nodes; i++) {
+                int x = esp_random() % MATRIX_COLS;
+                int y = esp_random() % MATRIX_ROWS;
+
+                if (current_brightness[x][y] < NORMAL_BRIGHTNESS) {
+                    active_nodes[base_idx + i].x = x;
+                    active_nodes[base_idx + i].y = y;
+                    active_nodes[base_idx + i].step = 0;
+                    active_nodes[base_idx + i].fade_steps = FADE_STEPS + (esp_random() % 10);
+                    active_nodes[base_idx + i].delay = FADE_DELAY_MS + (esp_random() % 20);
+                    active_nodes[base_idx + i].completed = false;
+                    nodes_created++;
+                }
+                
+                // Aggiungiamo un piccolo delay per non bloccare altre operazioni
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+            active_clusters++;
+        }
+
+        for (int c = 0; c < active_clusters; c++) {
+            bool cluster_completed = true;
+            int base_idx = c * MAX_NODES_PER_CLUSTER;
+
+            for (int i = 0; i < MAX_NODES_PER_CLUSTER; i++) {
+                AnimNode *node = &active_nodes[base_idx + i];
+                if (node->step <= node->fade_steps && !node->completed) {
+                    cluster_completed = false;
+                    if (node->step < node->fade_steps) {
+                        uint8_t brightness = (node->step * NORMAL_BRIGHTNESS) / node->fade_steps;
+                        rgb_color_t curr_color = {.r = 0, .g = 0, .b = brightness};
+                        matrix_set_pixel(node->x, node->y, curr_color);
+                        node->step++;
+                        current_brightness[node->x][node->y] = brightness;
+                    } else {
+                        node->completed = true;
+                    }
+                }
+            }
+
+            if (cluster_completed) {
+                if (c < active_clusters - 1) {
+                    memcpy(&active_nodes[base_idx], 
+                           &active_nodes[base_idx + MAX_NODES_PER_CLUSTER], 
+                           MAX_NODES_PER_CLUSTER * sizeof(AnimNode));
+                }
+                active_clusters--;
+                c--;
+            }
+        }
+
+        matrix_show();
+        vTaskDelay(pdMS_TO_TICKS(5));  // Ridotto il delay
+    }
+    
+    ESP_LOGI(TAG, "Matrix pattern initialization complete");
+    vTaskDelete(NULL);
+}
+
 void activate_new_node_task(void *arg) {
     rgb_color_t blue = {.r = 0, .g = 0, .b = 60};
     int x = *((int*)arg);

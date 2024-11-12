@@ -4,7 +4,9 @@ idf_component_register(
         "main.c" 
         "llm.c" 
         "captive_portal.c"
-        "wifi_manager.c"  
+        "wifi_manager.c"
+        "motion_sensor.c"
+        "button_manager.c"
     INCLUDE_DIRS 
         ""
     REQUIRES
@@ -16,6 +18,7 @@ idf_component_register(
         spiffs
         driver
         esp_timer
+        esp_hw_support    # Questo include esp_random
     PRIV_REQUIRES
         esp_psram
     LDFRAGMENTS 
