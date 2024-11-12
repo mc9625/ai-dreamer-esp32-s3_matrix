@@ -16,6 +16,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "ws_matrix.h"
+#include "esp_random.h" 
 
 typedef float v4sf __attribute__((aligned(16)));
 

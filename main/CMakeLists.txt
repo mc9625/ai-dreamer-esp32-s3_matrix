@@ -14,6 +14,7 @@ idf_component_register(
         nvs_flash
         spiffs
         driver
+        esp_timer
     PRIV_REQUIRES
         esp_psram
     LDFRAGMENTS 
