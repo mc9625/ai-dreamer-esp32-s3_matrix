@@ -24,15 +24,30 @@
 #include "esp_timer.h"
 
 // I2C e MPU6050 definizioni
-#define I2C_MASTER_SCL_IO           8      // SCL pin 
-#define I2C_MASTER_SDA_IO           18     // SDA pin
-#define I2C_MASTER_NUM              0      // I2C master number
-#define I2C_MASTER_FREQ_HZ          400000 // I2C master clock frequency
-#define I2C_MASTER_TIMEOUT_MS       1000   // I2C master timeout
-#define MPU6050_ADDR               0x68    // MPU6050 device address
-#define SHAKE_THRESHOLD            16000   // Soglia per rilevare scuotimento forte
-#define SHAKE_DURATION_MS          2000    // Durata minima dello scuotimento
-#define SHAKE_SAMPLES_THRESHOLD    20      // Numero minimo di campioni sopra soglia
+#define I2C_MASTER_SCL_IO           12    // SCL pin (come Arduino)
+#define I2C_MASTER_SDA_IO           11    // SDA pin (come Arduino)
+#define I2C_MASTER_NUM              0     // Numero controller I2C
+#define I2C_MASTER_FREQ_HZ          400000 // 400KHz
+#define I2C_MASTER_TIMEOUT_MS       100   // Timeout per operazioni I2C
+#define QMI8658_ADDR               0x6B   // Indirizzo I2C del QMI8658
+
+// Soglie per il rilevamento movimento
+#define ACCEL_THRESHOLD_HIGH       0.15f  // Soglia accelerazione positiva
+#define ACCEL_Z_HIGH              -0.9f   // Soglia Z alta
+#define ACCEL_Z_LOW               -1.1f   // Soglia Z bassa
+
+#define MOVEMENT_THRESHOLD      1.5f   // Soglia per il movimento significativo
+#define MOVEMENT_COUNT         100     // Numero di campioni sopra soglia necessari
+#define MOVEMENT_WINDOW_MS     2000    // Finestra temporale per il movimento (2 secondi)
+
+#define VERTICAL_THRESHOLD    0.8f    // Quando un asse è quasi verticale (circa 80% di g)
+#define VERTICAL_TIME_MS     1000    // Tempo minimo in verticale (1 secondo)
+#define FLIP_THRESHOLD       0.5f    // Soglia per rilevare il flip veloce
+#define FLIP_WINDOW_MS       500    
+#define SHAKE_THRESHOLD      2.0f    // Soglia di accelerazione per lo shake
+#define SHAKE_COUNT         10       // Numero minimo di shake necessari
+#define SHAKE_WINDOW_MS     1000     // Finestra temporale per gli shake (1 secondo)
+
 
 // Altri define esistenti
 #define MAIN_TASK_STACK_SIZE 16384
@@ -47,18 +62,97 @@ static bool movement_detected = false;
 static EventGroupHandle_t system_events;
 
 typedef struct {
-    int16_t accel_x;
-    int16_t accel_y;
-    int16_t accel_z;
-} mpu6050_accel_t;
+    float x;
+    float y;
+    float z;
+} qmi8658_data_t;
 
+typedef enum {
+    WAIT_VERTICAL,    // In attesa che il dispositivo sia verticale
+    WAIT_FLIP,       // In attesa del flip dopo la posizione verticale
+} device_state_t;
+
+
+static uint8_t X_EN = 0, Y_EN = 0;
+static uint8_t Time_X_A = 0, Time_X_B = 0, Time_Y_A = 0, Time_Y_B = 0;
 // I2C Master Initialization
+
+static esp_err_t read_qmi8658_accel(qmi8658_data_t *accel_data) {
+    uint8_t data[6];
+    uint8_t reg = 0x35;  // Registro dati accelerometro
+    
+    esp_err_t ret = i2c_master_write_read_device(I2C_MASTER_NUM, QMI8658_ADDR,
+                                                &reg, 1, data, sizeof(data),
+                                                pdMS_TO_TICKS(100));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read accelerometer data: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Conversione dati raw
+    accel_data->x = (int16_t)((data[1] << 8) | data[0]) / 8192.0f;
+    accel_data->y = (int16_t)((data[3] << 8) | data[2]) / 8192.0f;
+    accel_data->z = (int16_t)((data[5] << 8) | data[4]) / 8192.0f;
+    
+    return ESP_OK;
+}
+
+static esp_err_t init_qmi8658(void) {
+    ESP_LOGI(TAG, "Initializing QMI8658...");
+    
+    // Test connessione base
+    uint8_t who_am_i_reg = 0x00;
+    uint8_t who_am_i_value;
+    
+    esp_err_t ret = i2c_master_write_read_device(I2C_MASTER_NUM, QMI8658_ADDR,
+                                                &who_am_i_reg, 1, &who_am_i_value, 1,
+                                                pdMS_TO_TICKS(100));
+                                                
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read WHO_AM_I register");
+        return ret;
+    }
+
+    // Setup dispositivo
+    uint8_t wake_cmd[] = {0x15, 0x00};
+    ret = i2c_master_write_to_device(I2C_MASTER_NUM, QMI8658_ADDR,
+                                    wake_cmd, sizeof(wake_cmd),
+                                    pdMS_TO_TICKS(100));
+    if (ret != ESP_OK) return ret;
+
+    // Configura accelerometro
+    uint8_t acc_config[] = {0x16, 0x62};
+    ret = i2c_master_write_to_device(I2C_MASTER_NUM, QMI8658_ADDR,
+                                    acc_config, sizeof(acc_config),
+                                    pdMS_TO_TICKS(100));
+    if (ret != ESP_OK) return ret;
+
+    // Configura giroscopio
+    uint8_t gyro_config[] = {0x17, 0x63};
+    ret = i2c_master_write_to_device(I2C_MASTER_NUM, QMI8658_ADDR,
+                                    gyro_config, sizeof(gyro_config),
+                                    pdMS_TO_TICKS(100));
+    if (ret != ESP_OK) return ret;
+
+    ESP_LOGI(TAG, "QMI8658 initialization successful");
+    return ESP_OK;
+}
+
+
 static esp_err_t init_i2c_master(void) {
-    ESP_LOGI(TAG, "Initializing I2C master...");
+    ESP_LOGI(TAG, "Initializing I2C master for QMI8658...");
     
     // Reset pins
     gpio_reset_pin(I2C_MASTER_SCL_IO);
     gpio_reset_pin(I2C_MASTER_SDA_IO);
+    
+    gpio_set_direction(I2C_MASTER_SCL_IO, GPIO_MODE_INPUT_OUTPUT_OD);
+    gpio_set_direction(I2C_MASTER_SDA_IO, GPIO_MODE_INPUT_OUTPUT_OD);
+    
+    gpio_set_level(I2C_MASTER_SCL_IO, 1);
+    gpio_set_level(I2C_MASTER_SDA_IO, 1);
+    
+    ESP_LOGI(TAG, "Configuring I2C with SCL=%d, SDA=%d", I2C_MASTER_SCL_IO, I2C_MASTER_SDA_IO);
     
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
@@ -66,7 +160,7 @@ static esp_err_t init_i2c_master(void) {
         .scl_io_num = I2C_MASTER_SCL_IO,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+        .master.clk_speed = 400000,
         .clk_flags = 0
     };
     
@@ -75,6 +169,10 @@ static esp_err_t init_i2c_master(void) {
         ESP_LOGE(TAG, "I2C parameter configuration failed: %s", esp_err_to_name(err));
         return err;
     }
+
+    // Prima rimuovi eventuali vecchie installazioni
+    i2c_driver_delete(I2C_MASTER_NUM);
+    vTaskDelay(pdMS_TO_TICKS(100));  // Piccolo delay
 
     err = i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
     if (err != ESP_OK) {
@@ -86,146 +184,111 @@ static esp_err_t init_i2c_master(void) {
     return ESP_OK;
 }
 
-static esp_err_t init_mpu6050(void) {
-    ESP_LOGI(TAG, "Initializing MPU6050...");
+
+
+static esp_err_t safe_start_wifi_and_portal(void) {
+    // Reset dei flag per sicurezza
+    wifi_requested = false;
+    movement_detected = false;
+
+    // Ferma tutto prima di ricominciare
+    wifi_manager_stop();
+    vTaskDelay(pdMS_TO_TICKS(500));  // Attendi che tutto sia fermato
     
-    // Test the connection first
-    uint8_t test_reg = 0x75; // WHO_AM_I register
-    uint8_t test_data = 0;
-    
-    esp_err_t err = i2c_master_write_read_device(I2C_MASTER_NUM, MPU6050_ADDR,
-                                                &test_reg, 1, &test_data, 1,
-                                                pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS));
-    
+    ESP_LOGI(TAG, "Starting WiFi manager...");
+    esp_err_t err = wifi_manager_start();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to communicate with MPU6050: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to start WiFi manager: %s", esp_err_to_name(err));
         return err;
     }
-    
-    if (test_data != 0x68) {
-        ESP_LOGE(TAG, "Unexpected WHO_AM_I value: 0x%02X (expected 0x68)", test_data);
-        return ESP_FAIL;
-    }
-    
-    // Wake up MPU6050
-    uint8_t wake_cmd[] = {0x6B, 0x00};
-    err = i2c_master_write_to_device(I2C_MASTER_NUM, MPU6050_ADDR,
-                                    wake_cmd, sizeof(wake_cmd),
-                                    pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS));
+
+    // Attendi che il WiFi sia pronto
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    ESP_LOGI(TAG, "Initializing captive portal...");
+    err = captive_portal_init(wifi_netif);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to wake up MPU6050: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to init captive portal: %s", esp_err_to_name(err));
+        wifi_manager_stop();
         return err;
     }
+
+    // Imposta i flag solo se tutto è andato a buon fine
+    wifi_requested = true;
+    movement_detected = true;
     
-    // Configure accelerometer for ±16g range
-    uint8_t accel_config[] = {0x1C, 0x18};
-    err = i2c_master_write_to_device(I2C_MASTER_NUM, MPU6050_ADDR,
-                                    accel_config, sizeof(accel_config),
-                                    pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS));
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to configure MPU6050 accelerometer: %s", esp_err_to_name(err));
-        return err;
-    }
-    
-    ESP_LOGI(TAG, "MPU6050 initialized successfully");
+    ESP_LOGI(TAG, "WiFi and captive portal started successfully");
     return ESP_OK;
 }
 
-static esp_err_t read_mpu6050_accel(mpu6050_accel_t *accel_data) {
-    if (accel_data == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
 
-    uint8_t data[6];
-    uint8_t reg = 0x3B;  // ACCEL_XOUT_H register
-    
-    esp_err_t ret = i2c_master_write_read_device(I2C_MASTER_NUM, MPU6050_ADDR,
-                                                &reg, 1, data, sizeof(data),
-                                                pdMS_TO_TICKS(I2C_MASTER_TIMEOUT_MS));
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    accel_data->accel_x = (data[0] << 8) | data[1];
-    accel_data->accel_y = (data[2] << 8) | data[3];
-    accel_data->accel_z = (data[4] << 8) | data[5];
-    
-    return ESP_OK;
-}
-
-static float calculate_magnitude(int16_t x, int16_t y, int16_t z) {
-    float x_sq = (float)x * (float)x;
-    float y_sq = (float)y * (float)y;
-    float z_sq = (float)z * (float)z;
-    return sqrtf(x_sq + y_sq + z_sq);
-}
-
-// Motion monitor task
 static void motion_monitor_task(void *pvParameters) {
     ESP_LOGI(TAG, "Motion monitor task started");
     
+    vTaskDelay(pdMS_TO_TICKS(2000));  // Delay iniziale per stabilizzazione
+    
     int shake_count = 0;
     int64_t shake_start_time = 0;
+    float last_x = 0, last_y = 0, last_z = 0;
     
     while(1) {
-        mpu6050_accel_t accel_data;
-        if (read_mpu6050_accel(&accel_data) == ESP_OK) {
-            float magnitude = calculate_magnitude(
-                accel_data.accel_x,
-                accel_data.accel_y,
-                accel_data.accel_z
-            );
+        qmi8658_data_t accel_data;
+        esp_err_t ret = read_qmi8658_accel(&accel_data);
+        
+        if (ret == ESP_OK) {
+            float delta_x = fabsf(accel_data.x - last_x);
+            float delta_y = fabsf(accel_data.y - last_y);
+            float delta_z = fabsf(accel_data.z - last_z);
             
-            if (magnitude > SHAKE_THRESHOLD) {
+            float total_delta = sqrtf(delta_x * delta_x + delta_y * delta_y + delta_z * delta_z);
+            
+            // Verifica stato del WiFi usando l'interfaccia esistente
+            int wifi_state = wifi_manager_get_state();
+            if (wifi_state == WIFI_STATE_OFF) {
+                wifi_requested = false;
+                movement_detected = false;
+            }
+            
+            if (total_delta > SHAKE_THRESHOLD) {
                 if (shake_count == 0) {
                     shake_start_time = esp_timer_get_time() / 1000;
                 }
                 shake_count++;
                 
+                ESP_LOGD(TAG, "Shake detected! Count: %d, Delta: %.2f", shake_count, total_delta);
+                
                 int64_t current_time = esp_timer_get_time() / 1000;
-                if (shake_count >= SHAKE_SAMPLES_THRESHOLD && 
-                    (current_time - shake_start_time) <= SHAKE_DURATION_MS) {
+                if (shake_count >= SHAKE_COUNT && 
+                    (current_time - shake_start_time) <= SHAKE_WINDOW_MS) {
                     
-                    if (!wifi_requested && !movement_detected) {
-                        ESP_LOGI(TAG, "Shake detected! Starting WiFi");
-                        wifi_requested = true;
-                        movement_detected = true;
-                        
-                        esp_err_t err = wifi_manager_start();
+                    ESP_LOGI(TAG, "Significant shake sequence detected!");
+                    
+                    if (wifi_state == WIFI_STATE_OFF) {
+                        esp_err_t err = safe_start_wifi_and_portal();
                         if (err != ESP_OK) {
-                            ESP_LOGE(TAG, "Failed to start WiFi manager: %s", esp_err_to_name(err));
-                            wifi_requested = false;
-                            movement_detected = false;
-                            shake_count = 0;
-                            continue;
+                            ESP_LOGE(TAG, "Failed to start WiFi: %s", esp_err_to_name(err));
                         }
-
-                        err = captive_portal_init(wifi_netif);
-                        if (err != ESP_OK) {
-                            ESP_LOGE(TAG, "Failed to init captive portal: %s", esp_err_to_name(err));
-                            wifi_manager_stop();
-                            wifi_requested = false;
-                            movement_detected = false;
-                            shake_count = 0;
-                            continue;
-                        }
-
-                        ESP_LOGI(TAG, "WiFi and captive portal started successfully");
+                    } else {
+                        ESP_LOGI(TAG, "WiFi already active, state: %d", wifi_state);
                     }
+                    
                     shake_count = 0;
                 }
             } else {
                 int64_t current_time = esp_timer_get_time() / 1000;
-                if ((current_time - shake_start_time) > SHAKE_DURATION_MS) {
+                if ((current_time - shake_start_time) > SHAKE_WINDOW_MS) {
                     shake_count = 0;
                 }
             }
+            
+            last_x = accel_data.x;
+            last_y = accel_data.y;
+            last_z = accel_data.z;
         }
+        
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
-
-
 // Task synchronization
 static EventGroupHandle_t system_events;
 #define LLM_COMPLETE_BIT BIT0
@@ -273,42 +336,27 @@ static void button_monitor_task(void *pvParameters) {
         }
 
         if (level == 0) {
-            ESP_LOGI(TAG, "Button press detected");
-            vTaskDelay(pdMS_TO_TICKS(50));
+        ESP_LOGI(TAG, "Button press detected");
+        vTaskDelay(pdMS_TO_TICKS(50));
+        
+        level = gpio_get_level(BOOT_BUTTON_PIN);
+        if (level == 0) {
+            ESP_LOGI(TAG, "Button press confirmed after debounce");
             
-            level = gpio_get_level(BOOT_BUTTON_PIN);
-            if (level == 0) {
-                ESP_LOGI(TAG, "Button press confirmed after debounce");
-                
-                if (!wifi_requested) {
-                    ESP_LOGI(TAG, "Starting WiFi and captive portal");
-                    wifi_requested = true;
-                    movement_detected = false;  // Reset questo flag
-                    
-                    esp_err_t err = wifi_manager_start();
-                    if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "Failed to start WiFi manager: %s", esp_err_to_name(err));
-                        wifi_requested = false;
-                        continue;
-                    }
-
-                    err = captive_portal_init(wifi_netif);
-                    if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "Failed to init captive portal: %s", esp_err_to_name(err));
-                        wifi_manager_stop();
-                        wifi_requested = false;
-                        continue;
-                    }
-
-                    ESP_LOGI(TAG, "WiFi and captive portal started successfully");
+            if (!wifi_requested) {
+                ESP_LOGI(TAG, "Starting WiFi and captive portal");
+                esp_err_t err = safe_start_wifi_and_portal();
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to start WiFi and captive portal");
                 }
-                
-                while(gpio_get_level(BOOT_BUTTON_PIN) == 0) {
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                }
-                ESP_LOGI(TAG, "Button released");
             }
+            
+            while(gpio_get_level(BOOT_BUTTON_PIN) == 0) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            ESP_LOGI(TAG, "Button released");
         }
+    }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
@@ -432,16 +480,20 @@ void app_main(void) {
 
     // Initialize I2C and MPU6050
     esp_err_t i2c_ret = init_i2c_master();
-    if (i2c_ret == ESP_OK) {
-        esp_err_t mpu_ret = init_mpu6050();
-        if (mpu_ret == ESP_OK) {
-            xTaskCreate(motion_monitor_task, "motion_monitor", 4096, NULL, 
-                       tskIDLE_PRIORITY + 3, NULL);
-        } else {
-            ESP_LOGE(TAG, "MPU6050 initialization failed: %s", esp_err_to_name(mpu_ret));
-        }
+    if (i2c_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize I2C: %s", esp_err_to_name(i2c_ret));
     } else {
-        ESP_LOGE(TAG, "I2C initialization failed: %s", esp_err_to_name(i2c_ret));
+        ESP_LOGI(TAG, "I2C initialized successfully, initializing QMI8658...");
+        vTaskDelay(pdMS_TO_TICKS(100));  // Breve delay
+        
+        esp_err_t sensor_ret = init_qmi8658();
+        if (sensor_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to initialize QMI8658: %s", esp_err_to_name(sensor_ret));
+        } else {
+            ESP_LOGI(TAG, "QMI8658 initialized successfully, starting monitor task...");
+            xTaskCreate(motion_monitor_task, "motion_monitor", 4096, NULL, 
+                    tskIDLE_PRIORITY + 3, NULL);
+        }
     }
 
     // Prepare LLM parameters
