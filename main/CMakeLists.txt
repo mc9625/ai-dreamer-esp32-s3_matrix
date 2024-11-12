@@ -4,6 +4,7 @@ idf_component_register(
         "main.c" 
         "llm.c" 
         "captive_portal.c"
+        "wifi_manager.c"  
     INCLUDE_DIRS 
         ""
     REQUIRES

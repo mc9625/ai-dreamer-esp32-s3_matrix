@@ -4,6 +4,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdlib.h>
+#include "esp_random.h"
 
 // WS2812B timing (in RMT ticks, 1 tick = 25ns with clock divider of 2)
 #define RMT_CLK_DIV 2
@@ -13,6 +14,102 @@
 #define T1L 16    // 0.45us
 
 static const char* TAG = "WS_MATRIX";
+
+void initialize_matrix_pattern(void) {
+    matrix_clear();
+
+    typedef struct {
+        int x;
+        int y;
+        int step;
+        int fade_steps;
+        int delay;
+        bool completed;
+    } AnimNode;
+
+    #define MAX_CONCURRENT_NODES 2
+    #define MAX_NODES_PER_CLUSTER 3
+
+    AnimNode active_nodes[MAX_NODES_PER_CLUSTER * MAX_CONCURRENT_NODES] = {0};
+    int total_nodes = MIN_INITIAL_NODES + (esp_random() % (MAX_INITIAL_NODES - MIN_INITIAL_NODES));
+    int nodes_created = 0;
+    int active_clusters = 0;
+
+    uint8_t current_brightness[MATRIX_COLS][MATRIX_ROWS] = {0};
+
+    while (nodes_created < total_nodes || active_clusters > 0) {
+        if (nodes_created < total_nodes && active_clusters < MAX_CONCURRENT_NODES) {
+            int nodes_in_cluster = 1 + (esp_random() % MAX_NODES_PER_CLUSTER);
+            int base_idx = active_clusters * MAX_NODES_PER_CLUSTER;
+
+            for (int i = 0; i < nodes_in_cluster && nodes_created < total_nodes; i++) {
+                int x = esp_random() % MATRIX_COLS;
+                int y = esp_random() % MATRIX_ROWS;
+
+                if (current_brightness[x][y] < NORMAL_BRIGHTNESS) {
+                    active_nodes[base_idx + i].x = x;
+                    active_nodes[base_idx + i].y = y;
+                    active_nodes[base_idx + i].step = 0;
+                    active_nodes[base_idx + i].fade_steps = FADE_STEPS + (esp_random() % 10);
+                    active_nodes[base_idx + i].delay = FADE_DELAY_MS + (esp_random() % 20);
+                    active_nodes[base_idx + i].completed = false;
+                    nodes_created++;
+                } else {
+                    current_brightness[x][y] = MIN(current_brightness[x][y] + 10, NORMAL_BRIGHTNESS);
+                    rgb_color_t updated_color = {.r = 0, .g = 0, .b = current_brightness[x][y]};
+                    matrix_set_pixel(x, y, updated_color);
+                }
+            }
+            active_clusters++;
+        }
+
+        for (int c = 0; c < active_clusters; c++) {
+            int cluster_completed = true;
+            int base_idx = c * MAX_NODES_PER_CLUSTER;
+
+            for (int i = 0; i < MAX_NODES_PER_CLUSTER; i++) {
+                AnimNode *node = &active_nodes[base_idx + i];
+                if (node->step <= node->fade_steps && !node->completed) {
+                    cluster_completed = false;
+                    if (node->step < node->fade_steps) {
+                        uint8_t brightness = (node->step * NORMAL_BRIGHTNESS) / node->fade_steps;
+                        rgb_color_t curr_color = {.r = 0, .g = 0, .b = brightness};
+                        matrix_set_pixel(node->x, node->y, curr_color);
+                        node->step++;
+                        current_brightness[node->x][node->y] = brightness;
+                    } else {
+                        rgb_color_t final_color = {.r = 0, .g = 0, .b = NORMAL_BRIGHTNESS};
+                        matrix_set_pixel(node->x, node->y, final_color);
+                        node->completed = true;
+                    }
+                }
+            }
+
+            if (cluster_completed) {
+                if (c < active_clusters - 1) {
+                    for (int j = 0; j < MAX_NODES_PER_CLUSTER; j++) {
+                        active_nodes[base_idx + j] = active_nodes[base_idx + j + MAX_NODES_PER_CLUSTER];
+                    }
+                }
+                active_clusters--;
+                c--;
+            }
+        }
+
+        matrix_show();
+        vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS));
+    }
+}
+
+void activate_new_node_task(void *arg) {
+    rgb_color_t blue = {.r = 0, .g = 0, .b = 60};
+    int x = *((int*)arg);
+    int y = *((int*)arg + 1);
+
+    fade_in_single_pixel(x, y, blue);
+    free(arg);
+    vTaskDelete(NULL);
+}
 
 // Global state variables
 static rmt_channel_t rmt_channel = RMT_CHANNEL_0;

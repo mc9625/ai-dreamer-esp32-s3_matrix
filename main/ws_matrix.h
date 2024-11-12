@@ -1,10 +1,11 @@
 #ifndef WS_MATRIX_H
 #define WS_MATRIX_H
 
-#include "driver/rmt.h"  // Torniamo al driver legacy
-#include "driver/gpio.h"
-#include "esp_log.h"
 #include <stdint.h>
+#include <stdbool.h>
+#include "driver/gpio.h"
+#include "driver/rmt.h"
+#include "esp_log.h"
 
 // Matrix configuration
 #define RGB_CONTROL_PIN GPIO_NUM_14
@@ -23,6 +24,11 @@
 #define FLASH_INTENSITY 255    
 #define FLASH_DURATION_MS 100 
 
+// Pattern initialization constants
+#define MIN_INITIAL_NODES 20
+#define MAX_INITIAL_NODES 40
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
 typedef struct {
     uint8_t r;
     uint8_t g;
@@ -36,6 +42,7 @@ void matrix_show(void);
 void matrix_clear(void);
 void test_matrix(void);
 void fade_in_single_pixel(uint8_t x, uint8_t y, rgb_color_t color);
+void initialize_matrix_pattern(void);
 void activate_new_node_task(void *arg);
 
-#endif
+#endif /* WS_MATRIX_H */

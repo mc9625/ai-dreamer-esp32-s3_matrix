@@ -1,29 +1,27 @@
 #include <stdio.h>
 #include <string.h>
-#include "esp_spiffs.h"
-#include "esp_log.h"
-#include "esp_wifi.h"
-#include "esp_netif.h"
-#include "esp_event.h"
-#include "nvs_flash.h"
+#include <stdbool.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_spiffs.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "driver/gpio.h"
+#include "driver/rmt.h"
+
 #include "llm.h"
 #include "ws_matrix.h"
+#include "wifi_manager.h"
 #include "captive_portal.h"
-#include "esp_mac.h"
-#include "dhcpserver/dhcpserver.h"
-#include "esp_netif_types.h"
-#include "lwip/dns.h"
-#include "lwip/tcpip.h"
-#include "esp_http_server.h"
-
 
 static const char *TAG = "MAIN";
 
 // Constants
-#define MIN_INITIAL_NODES 20
-#define MAX_INITIAL_NODES 40
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAIN_TASK_STACK_SIZE 16384
 #define LLM_TASK_PRIORITY    5
 
@@ -31,10 +29,9 @@ static const char *TAG = "MAIN";
 static EventGroupHandle_t system_events;
 #define LLM_COMPLETE_BIT BIT0
 
-
 static esp_netif_t *wifi_netif = NULL;
 
-// Struttura per i parametri LLM
+// LLM parameters structure
 typedef struct {
     Transformer* transformer;
     Tokenizer* tokenizer;
@@ -43,49 +40,12 @@ typedef struct {
     generated_complete_cb callback;
 } LLMParams;
 
-// Forward declarations delle funzioni
+// Forward declarations
 static void generate_complete_cb(float tk_s);
 static esp_err_t init_storage(void);
-static esp_err_t init_wifi(void);
-void initialize_matrix_pattern(void);
-void activate_new_node_task(void *arg);
-
-// Task LLM
-static void llm_task(void *pvParameters)
-{
-    LLMParams* params = (LLMParams*)pvParameters;
-    
-    // Generate text
-    generate(params->transformer, params->tokenizer, params->sampler,
-             NULL, params->steps, params->callback);
-    
-    // Free resources
-    free_transformer(params->transformer);
-    free_tokenizer(params->tokenizer);
-    free_sampler(params->sampler);
-    free(params);
-    
-    // Signal completion
-    xEventGroupSetBits(system_events, LLM_COMPLETE_BIT);
-    vTaskDelete(NULL);
-}
-
-// WiFi event handler
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                             int32_t event_id, void* event_data)
-{
-    if (event_base == WIFI_EVENT) {
-        if (event_id == WIFI_EVENT_AP_STACONNECTED) {
-            wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
-        } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-            wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
-        }
-    }
-}
 
 // Storage initialization
-static esp_err_t init_storage(void)
-{
+static esp_err_t init_storage(void) {
     ESP_LOGI(TAG, "Initializing SPIFFS");
     esp_vfs_spiffs_conf_t conf = {
         .base_path = "/data",
@@ -108,78 +68,23 @@ static esp_err_t init_storage(void)
     return ret;
 }
 
-// WiFi initialization
-static esp_err_t init_wifi(void)
-{
-    ESP_LOGI(TAG, "Initializing WiFi in AP mode...");
-
-    // Initialize TCP/IP network interface
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    // Create default AP
-    wifi_netif = esp_netif_create_default_wifi_ap();
-
-    // Configure static IP
-    esp_netif_ip_info_t ip_info;
-    IP4_ADDR(&ip_info.ip, 10, 0, 0, 1);
-    IP4_ADDR(&ip_info.gw, 10, 0, 0, 1);
-    IP4_ADDR(&ip_info.netmask, 255, 0, 0, 0);
-    esp_netif_set_ip_info(esp_netif_get_handle_from_ifkey("WIFI_AP_DEF"), &ip_info);
-        // Stop DHCP server, set IP info
-    ESP_ERROR_CHECK(esp_netif_dhcps_stop(wifi_netif));
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(wifi_netif, &ip_info));
-
-    // Configure DNS
-    esp_netif_dns_info_t dns_info = {0};
-    IP4_ADDR(&dns_info.ip.u_addr.ip4, 192, 168, 4, 1);
-    dns_info.ip.type = IPADDR_TYPE_V4;
-    ESP_ERROR_CHECK(esp_netif_set_dns_info(wifi_netif, ESP_NETIF_DNS_MAIN, &dns_info));
-
-    // Enable DNS option in DHCP
-    esp_netif_dhcp_option_mode_t opt_mode = ESP_NETIF_OP_SET;
-    esp_netif_dhcp_option_id_t opt_id = ESP_NETIF_DOMAIN_NAME_SERVER;
-    uint8_t dns_offer = 1;
-    ESP_ERROR_CHECK(esp_netif_dhcps_option(wifi_netif, opt_mode, opt_id, &dns_offer, sizeof(dns_offer)));
-
-    // Start DHCP server
-    ESP_ERROR_CHECK(esp_netif_dhcps_start(wifi_netif));
-
-    // Configure WiFi
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+// LLM task
+static void llm_task(void *pvParameters) {
+    LLMParams* params = (LLMParams*)pvParameters;
     
-    // Register event handler
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                      ESP_EVENT_ANY_ID,
-                                                      &wifi_event_handler,
-                                                      NULL,
-                                                      NULL));
-
-    // Configure AP
-    wifi_config_t wifi_config = {
-        .ap = {
-            .ssid = "ESP32-AI-DREAMER",
-            .ssid_len = strlen("ESP32-AI-DREAMER"),
-            .channel = 1,
-            .password = "",
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN,
-            .ssid_hidden = 0,
-            .beacon_interval = 100,
-            .pmf_cfg = {
-                .required = false
-            },
-        },
-    };
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "WiFi AP started with IP: 192.168.4.1");
-    return ESP_OK;
+    // Generate text
+    generate(params->transformer, params->tokenizer, params->sampler,
+             NULL, params->steps, params->callback);
+    
+    // Free resources
+    free_transformer(params->transformer);
+    free_tokenizer(params->tokenizer);
+    free_sampler(params->sampler);
+    free(params);
+    
+    // Signal completion
+    xEventGroupSetBits(system_events, LLM_COMPLETE_BIT);
+    vTaskDelete(NULL);
 }
 
 // Callback for LLM generation completion
@@ -187,107 +92,7 @@ static void generate_complete_cb(float tk_s) {
     ESP_LOGI(TAG, "Generation complete: %.2f tok/s", tk_s);
 }
 
-// Matrix pattern initialization
-void initialize_matrix_pattern(void) {
-    matrix_clear();
-
-    typedef struct {
-        int x;
-        int y;
-        int step;
-        int fade_steps;
-        int delay;
-        bool completed;
-    } AnimNode;
-
-    #define MAX_CONCURRENT_NODES 2
-    #define MAX_NODES_PER_CLUSTER 3
-
-    AnimNode active_nodes[MAX_NODES_PER_CLUSTER * MAX_CONCURRENT_NODES] = {0};
-    int total_nodes = MIN_INITIAL_NODES + (esp_random() % (MAX_INITIAL_NODES - MIN_INITIAL_NODES));
-    int nodes_created = 0;
-    int active_clusters = 0;
-
-    uint8_t current_brightness[MATRIX_COLS][MATRIX_ROWS] = {0};
-
-    while (nodes_created < total_nodes || active_clusters > 0) {
-        if (nodes_created < total_nodes && active_clusters < MAX_CONCURRENT_NODES) {
-            int nodes_in_cluster = 1 + (esp_random() % MAX_NODES_PER_CLUSTER);
-            int base_idx = active_clusters * MAX_NODES_PER_CLUSTER;
-
-            for (int i = 0; i < nodes_in_cluster && nodes_created < total_nodes; i++) {
-                int x = esp_random() % MATRIX_COLS;
-                int y = esp_random() % MATRIX_ROWS;
-
-                if (current_brightness[x][y] < NORMAL_BRIGHTNESS) {
-                    active_nodes[base_idx + i].x = x;
-                    active_nodes[base_idx + i].y = y;
-                    active_nodes[base_idx + i].step = 0;
-                    active_nodes[base_idx + i].fade_steps = FADE_STEPS + (esp_random() % 10);
-                    active_nodes[base_idx + i].delay = FADE_DELAY_MS + (esp_random() % 20);
-                    active_nodes[base_idx + i].completed = false;
-                    nodes_created++;
-                } else {
-                    current_brightness[x][y] = MIN(current_brightness[x][y] + 10, NORMAL_BRIGHTNESS);
-                    rgb_color_t updated_color = {.r = 0, .g = 0, .b = current_brightness[x][y]};
-                    matrix_set_pixel(x, y, updated_color);
-                }
-            }
-            active_clusters++;
-        }
-
-        for (int c = 0; c < active_clusters; c++) {
-            int cluster_completed = true;
-            int base_idx = c * MAX_NODES_PER_CLUSTER;
-
-            for (int i = 0; i < MAX_NODES_PER_CLUSTER; i++) {
-                AnimNode *node = &active_nodes[base_idx + i];
-                if (node->step <= node->fade_steps && !node->completed) {
-                    cluster_completed = false;
-                    if (node->step < node->fade_steps) {
-                        uint8_t brightness = (node->step * NORMAL_BRIGHTNESS) / node->fade_steps;
-                        rgb_color_t curr_color = {.r = 0, .g = 0, .b = brightness};
-                        matrix_set_pixel(node->x, node->y, curr_color);
-                        node->step++;
-                        current_brightness[node->x][node->y] = brightness;
-                    } else {
-                        rgb_color_t final_color = {.r = 0, .g = 0, .b = NORMAL_BRIGHTNESS};
-                        matrix_set_pixel(node->x, node->y, final_color);
-                        node->completed = true;
-                    }
-                }
-            }
-
-            if (cluster_completed) {
-                if (c < active_clusters - 1) {
-                    for (int j = 0; j < MAX_NODES_PER_CLUSTER; j++) {
-                        active_nodes[base_idx + j] = active_nodes[base_idx + j + MAX_NODES_PER_CLUSTER];
-                    }
-                }
-                active_clusters--;
-                c--;
-            }
-        }
-
-        matrix_show();
-        vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS));
-    }
-}
-
-// Task for new node activation
-void activate_new_node_task(void *arg) {
-    rgb_color_t blue = {.r = 0, .g = 0, .b = 60};
-    int x = *((int*)arg);
-    int y = *((int*)arg + 1);
-
-    fade_in_single_pixel(x, y, blue);
-    free(arg);
-    vTaskDelete(NULL);
-}
-
-// Main application
-void app_main(void)
-{
+void app_main(void) {
     // Create event group for synchronization
     system_events = xEventGroupCreate();
     
@@ -342,76 +147,13 @@ void app_main(void)
     xEventGroupWaitBits(system_events, LLM_COMPLETE_BIT,
                        pdTRUE, pdTRUE, portMAX_DELAY);
 
-    // Ensure LED animations are complete
-    matrix_clear();
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    // ------------------------
-    // WiFi and Captive Portal Initialization
-    // ------------------------
-    
-    // Initialize networking stack
+    // Initialize networking stack and WiFi
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(wifi_manager_init(&wifi_netif));
     
-    // Create default AP
-    wifi_netif = esp_netif_create_default_wifi_ap();
-    assert(wifi_netif);
-
-    // Initialize WiFi
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    // Register event handler
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                      ESP_EVENT_ANY_ID,
-                                                      &wifi_event_handler,
-                                                      NULL,
-                                                      NULL));
-
-    // Configure AP
-    wifi_config_t wifi_config = {
-        .ap = {
-            .ssid = "ESP32-AI-DREAMER",
-            .ssid_len = strlen("ESP32-AI-DREAMER"),
-            .channel = 1,
-            .password = "",
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN,
-            .pmf_cfg = {
-                .required = false
-            },
-        },
-    };
-
-    // Set WiFi mode and config
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "WiFi AP started with IP: 192.168.4.1");
-    
-    // Configure static IP and DNS
-    esp_netif_ip_info_t ip_info = {0};
-    IP4_ADDR(&ip_info.ip, 192, 168, 4, 1);
-    IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);
-    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
-
-    // Stop DHCP server temporarily to configure it
-    ESP_ERROR_CHECK(esp_netif_dhcps_stop(wifi_netif));
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(wifi_netif, &ip_info));
-
-    // Configure DNS
-    esp_netif_dns_info_t dns_info = {0};
-    IP4_ADDR(&dns_info.ip.u_addr.ip4, 192, 168, 4, 1);
-    dns_info.ip.type = IPADDR_TYPE_V4;
-    ESP_ERROR_CHECK(esp_netif_set_dns_info(wifi_netif, ESP_NETIF_DNS_MAIN, &dns_info));
-
-    // Restart DHCP server
-    ESP_ERROR_CHECK(esp_netif_dhcps_start(wifi_netif));
-
     // Initialize captive portal
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Give some time for WiFi to stabilize
+    vTaskDelay(pdMS_TO_TICKS(1000));
     ESP_ERROR_CHECK(captive_portal_init(wifi_netif));
     
     ESP_LOGI(TAG, "Initialization complete");
