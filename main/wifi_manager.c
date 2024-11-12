@@ -8,6 +8,9 @@
 
 static const char *TAG = "WIFI_MANAGER";
 
+static wifi_state_t wifi_state = WIFI_STATE_OFF;
+static esp_netif_t *current_netif = NULL;
+
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                              int32_t event_id, void* event_data)
 {
@@ -16,20 +19,23 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
             ESP_LOGI(TAG, "Station connected, MAC: " MACSTR ", AID: %d",
                     MAC2STR(event->mac), event->aid);
+            wifi_state = WIFI_STATE_CLIENT_CONNECTED;
         } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
             wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
             ESP_LOGI(TAG, "Station disconnected, MAC: " MACSTR ", AID: %d",
                     MAC2STR(event->mac), event->aid);
+            wifi_state = WIFI_STATE_ON;
         }
     }
 }
 
 esp_err_t wifi_manager_init(esp_netif_t **wifi_netif)
 {
-    ESP_LOGI(TAG, "Initializing WiFi in AP mode...");
-
+    ESP_LOGI(TAG, "Initializing WiFi manager...");
+    
     // Create default AP
     *wifi_netif = esp_netif_create_default_wifi_ap();
+    current_netif = *wifi_netif;
     assert(*wifi_netif);
 
     // Initialize WiFi
@@ -42,6 +48,14 @@ esp_err_t wifi_manager_init(esp_netif_t **wifi_netif)
                                                       &wifi_event_handler,
                                                       NULL,
                                                       NULL));
+    return ESP_OK;
+}
+
+esp_err_t wifi_manager_start(void)
+{
+    if (wifi_state != WIFI_STATE_OFF) {
+        return ESP_OK;
+    }
 
     // Configure AP
     wifi_config_t wifi_config = {
@@ -68,18 +82,36 @@ esp_err_t wifi_manager_init(esp_netif_t **wifi_netif)
     IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);
     IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
 
-    ESP_ERROR_CHECK(esp_netif_dhcps_stop(*wifi_netif));
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(*wifi_netif, &ip_info));
+    ESP_ERROR_CHECK(esp_netif_dhcps_stop(current_netif));
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(current_netif, &ip_info));
 
     // Configure DNS
     esp_netif_dns_info_t dns_info = {0};
     IP4_ADDR(&dns_info.ip.u_addr.ip4, 192, 168, 4, 1);
     dns_info.ip.type = IPADDR_TYPE_V4;
-    ESP_ERROR_CHECK(esp_netif_set_dns_info(*wifi_netif, ESP_NETIF_DNS_MAIN, &dns_info));
+    ESP_ERROR_CHECK(esp_netif_set_dns_info(current_netif, ESP_NETIF_DNS_MAIN, &dns_info));
 
     // Restart DHCP server
-    ESP_ERROR_CHECK(esp_netif_dhcps_start(*wifi_netif));
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(current_netif));
 
+    wifi_state = WIFI_STATE_ON;
     ESP_LOGI(TAG, "WiFi AP started with IP: 192.168.4.1");
     return ESP_OK;
+}
+
+esp_err_t wifi_manager_stop(void)
+{
+    if (wifi_state == WIFI_STATE_OFF) {
+        return ESP_OK;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_stop());
+    wifi_state = WIFI_STATE_OFF;
+    ESP_LOGI(TAG, "WiFi AP stopped");
+    return ESP_OK;
+}
+
+wifi_state_t wifi_manager_get_state(void)
+{
+    return wifi_state;
 }
