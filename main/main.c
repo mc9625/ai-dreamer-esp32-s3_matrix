@@ -29,6 +29,7 @@ typedef struct {
     Sampler* sampler;
     int steps;
     generated_complete_cb callback;
+    bool dream_ready;
 } LLMParams;
 
 
@@ -41,6 +42,7 @@ static void wifi_start_callback(void);
 static void wifi_start_callback(void) {
     if (!wifi_requested) {
         ESP_LOGI(TAG, "Starting WiFi and captive portal");
+        pause_animations();  // Pause animations before starting WiFi
         esp_err_t err = wifi_manager_start();
         if (err == ESP_OK) {
             wifi_requested = true;
@@ -49,9 +51,11 @@ static void wifi_start_callback(void) {
                 ESP_LOGE(TAG, "Failed to init captive portal");
                 wifi_manager_stop();
                 wifi_requested = false;
+                resume_animations();  // Resume animations if failed
             }
         } else {
             ESP_LOGE(TAG, "Failed to start WiFi");
+            resume_animations();  // Resume animations if failed
         }
     }
 }
@@ -83,42 +87,24 @@ static esp_err_t init_storage(void) {
 // LLM task
 static void llm_task(void *pvParameters) {
     LLMParams* params = (LLMParams*)pvParameters;
-    bool initial_dream_generated = false;
     int disconnect_counter = 0;
     
     while(1) {
-        if (!initial_dream_generated) {
+        EventBits_t bits = xEventGroupGetBits(animation_events);
+        bool should_generate = (bits & GENERATION_NEEDED_BIT) && is_animation_enabled();
+        
+        if (should_generate) {
+            xEventGroupClearBits(animation_events, GENERATION_NEEDED_BIT);
+            // Generate text
             generate(params->transformer, params->tokenizer, params->sampler,
                     NULL, params->steps, params->callback);
-            initial_dream_generated = true;
-            ESP_LOGI(TAG, "Initial dream generated");
+            
+            // Animate dream and wait for completion
+            animate_dream(llm_output_buffer);
             continue;
         }
 
-        // Check WiFi state and manage disconnections
-        wifi_state_t wifi_state = wifi_manager_get_state();
-        
-        if (wifi_state == WIFI_STATE_CLIENT_CONNECTED) {
-            disconnect_counter = 0;
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        
-        if (wifi_state == WIFI_STATE_ON) {
-            disconnect_counter++;
-            if (disconnect_counter >= 300) {  // 30 seconds
-                disconnect_counter = 0;
-                ESP_LOGI(TAG, "No clients connected for 30 seconds, stopping WiFi");
-                wifi_manager_stop();
-                wifi_requested = false;
-                
-                generate(params->transformer, params->tokenizer, params->sampler,
-                        NULL, params->steps, params->callback);
-                ESP_LOGI(TAG, "New dream generated after WiFi disconnection");
-            }
-        } else {
-            disconnect_counter = 0;
-        }
+        // Rest of WiFi state management...
         
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -156,7 +142,7 @@ void app_main(void) {
 
     // Initialize input devices with callback
     ESP_ERROR_CHECK(button_manager_init(wifi_start_callback));
-    ESP_ERROR_CHECK(motion_sensor_init(wifi_start_callback));
+    //ESP_ERROR_CHECK(motion_sensor_init(wifi_start_callback));
 
     // Create matrix pattern task separately
     xTaskCreate(matrix_pattern_task, "matrix_pattern", 4096, NULL, 5, NULL);

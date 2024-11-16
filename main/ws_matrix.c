@@ -5,6 +5,8 @@
 #include "freertos/task.h"
 #include <stdlib.h>
 #include "esp_random.h"
+#include <math.h>
+#include "esp_timer.h"
 
 // WS2812B timing (in RMT ticks, 1 tick = 25ns with clock divider of 2)
 #define RMT_CLK_DIV 2
@@ -13,7 +15,28 @@
 #define T1H 24    // 0.8us
 #define T1L 16    // 0.45us
 
-static const char* TAG = "WS_MATRIX";
+static const char *TAG = "WS_MATRIX";
+static EventGroupHandle_t matrix_events = NULL;
+EventGroupHandle_t animation_events = NULL; 
+
+
+bool wait_matrix_pattern_complete(void) {
+    if (!matrix_events) {
+        return false;
+    }
+    EventBits_t bits = xEventGroupWaitBits(matrix_events, 
+                                          MATRIX_PATTERN_COMPLETE_BIT,
+                                          pdTRUE, pdTRUE, portMAX_DELAY);
+    return (bits & MATRIX_PATTERN_COMPLETE_BIT) != 0;
+}
+
+
+static bool animation_enabled = true;
+
+bool is_animation_enabled(void) {
+    return animation_enabled;
+}
+
 
 void initialize_matrix_pattern(void) {
     matrix_clear();
@@ -105,7 +128,7 @@ void matrix_pattern_task(void *pvParameters) {
     // Aggiungiamo un piccolo delay per permettere alle altre inizializzazioni di completarsi
     vTaskDelay(pdMS_TO_TICKS(100));
     
-    ESP_LOGI(TAG, "Starting matrix pattern initialization");
+    //ESP_LOGI(TAG, "Starting matrix pattern initialization");
     
     matrix_clear();
     matrix_show();
@@ -188,8 +211,8 @@ void matrix_pattern_task(void *pvParameters) {
         matrix_show();
         vTaskDelay(pdMS_TO_TICKS(5));  // Ridotto il delay
     }
-    
-    ESP_LOGI(TAG, "Matrix pattern initialization complete");
+    xEventGroupSetBits(matrix_events, MATRIX_PATTERN_COMPLETE_BIT);
+    //ESP_LOGI(TAG, "Matrix pattern initialization complete");
     vTaskDelete(NULL);
 }
 
@@ -211,23 +234,41 @@ static bool node_active[MATRIX_ROWS][MATRIX_COLS] = {0};
 static int total_active_nodes = 0;
 
 esp_err_t matrix_init(void) {
-    ESP_LOGI(TAG, "Initializing LED matrix...");
-    
-    gpio_reset_pin(RGB_CONTROL_PIN);
-    gpio_set_direction(RGB_CONTROL_PIN, GPIO_MODE_OUTPUT);
-    
-    rmt_config_t config = RMT_DEFAULT_CONFIG_TX(RGB_CONTROL_PIN, rmt_channel);
-    config.clk_div = RMT_CLK_DIV;
-    config.mem_block_num = 1;
-    
-    ESP_ERROR_CHECK(rmt_config(&config));
-    ESP_ERROR_CHECK(rmt_driver_install(config.channel, 0, 0));
-    
-    matrix_clear();
-    vTaskDelay(pdMS_TO_TICKS(100));
-    
-    ESP_LOGI(TAG, "Matrix initialization complete");
-    return ESP_OK;
+   ESP_LOGI(TAG, "Initializing LED matrix...");
+   
+   // Create event groups
+   matrix_events = xEventGroupCreate();
+   if (!matrix_events) {
+       ESP_LOGE(TAG, "Failed to create event group");
+       return ESP_ERR_NO_MEM;
+   }
+
+   animation_events = xEventGroupCreate();
+   if (!animation_events) {
+       ESP_LOGE(TAG, "Failed to create animation event group"); 
+       vEventGroupDelete(matrix_events);
+       return ESP_ERR_NO_MEM;
+   }
+
+   // Set initial generation needed
+   xEventGroupSetBits(animation_events, GENERATION_NEEDED_BIT);
+   
+   // Initialize hardware
+   gpio_reset_pin(RGB_CONTROL_PIN);
+   gpio_set_direction(RGB_CONTROL_PIN, GPIO_MODE_OUTPUT);
+   
+   rmt_config_t config = RMT_DEFAULT_CONFIG_TX(RGB_CONTROL_PIN, rmt_channel);
+   config.clk_div = RMT_CLK_DIV;
+   config.mem_block_num = 1;
+   
+   ESP_ERROR_CHECK(rmt_config(&config));
+   ESP_ERROR_CHECK(rmt_driver_install(config.channel, 0, 0));
+   
+   matrix_clear();
+   vTaskDelay(pdMS_TO_TICKS(100));
+   
+   ESP_LOGI(TAG, "Matrix initialization complete");
+   return ESP_OK;
 }
 
 static void ws2812_send_pixel(rgb_color_t color) {
@@ -311,35 +352,25 @@ static rgb_color_t dim_color(rgb_color_t color, uint8_t intensity) {
     return dimmed;
 }
 
-void fade_in_single_pixel(uint8_t x, uint8_t y, rgb_color_t color) {
-    // Prima fase: Fade in graduale
+void fade_in_single_pixel(int x, int y, rgb_color_t final_color) {
+    // Fade in from 0 to max brightness (NORMAL_BRIGHTNESS)
     for (int step = 0; step <= FADE_STEPS; step++) {
-        int intensity = (step * FADE_MAX_INTENSITY) / FADE_STEPS;
-        rgb_color_t dimmed = dim_color(color, intensity);
-        matrix_set_pixel(x, y, dimmed);
+        uint8_t intensity = (step * NORMAL_BRIGHTNESS) / FADE_STEPS;
+        rgb_color_t curr_color = {.r = 0, .g = 0, .b = intensity};
+        matrix_set_pixel(x, y, curr_color);
         matrix_show();
         vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS));
     }
-
-    // Seconda fase: Flash bianco
-    rgb_color_t white = {
-        .r = FLASH_INTENSITY,
-        .g = FLASH_INTENSITY,
-        .b = FLASH_INTENSITY
-    };
+    
+    // Flash white at full brightness
+    rgb_color_t white = {.r = FLASH_INTENSITY, .g = FLASH_INTENSITY, .b = FLASH_INTENSITY};
     matrix_set_pixel(x, y, white);
     matrix_show();
-    vTaskDelay(pdMS_TO_TICKS(FLASH_DURATION_MS));
-
-    // Fase finale: Torna al colore target
-    matrix_set_pixel(x, y, color);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Set final blue color at NORMAL_BRIGHTNESS
+    matrix_set_pixel(x, y, final_color);
     matrix_show();
-
-    // Aggiorna lo stato del nodo
-    if (!node_active[y][x]) {
-        node_active[y][x] = true;
-        total_active_nodes++;
-    }
 }
 
 void test_matrix(void) {
@@ -396,4 +427,113 @@ void test_matrix(void) {
     
     vTaskDelay(pdMS_TO_TICKS(1000));
     matrix_clear();
+}
+
+void animate_dream(const char* dream_text) {
+    if (!animation_enabled) {
+        ESP_LOGI(TAG, "Animation skipped - disabled");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Starting dream animation");
+    
+    if (!animation_events) {
+        animation_events = xEventGroupCreate();
+    }
+    
+    xEventGroupSetBits(animation_events, ANIMATION_IN_PROGRESS_BIT);
+    
+    // Find active LEDs
+    typedef struct {
+        int x;
+        int y;
+    } LedPosition;
+    
+    LedPosition active_leds[MATRIX_ROWS * MATRIX_COLS];
+    int num_active = 0;
+    
+    for (int y = 0; y < MATRIX_ROWS; y++) {
+        for (int x = 0; x < MATRIX_COLS; x++) {
+            if (framebuffer[y][x].b > 0) {
+                active_leds[num_active].x = x;
+                active_leds[num_active].y = y;
+                num_active++;
+            }
+        }
+    }
+    
+    ESP_LOGI(TAG, "Found %d active LEDs to animate", num_active);
+    
+    // Randomize order
+    for (int i = num_active - 1; i > 0; i--) {
+        int j = esp_random() % (i + 1);
+        LedPosition temp = active_leds[i];
+        active_leds[i] = active_leds[j];
+        active_leds[j] = temp;
+    }
+    
+    // Animate each LED
+    for (int i = 0; i < num_active; i++) {
+        if (!animation_enabled) {
+            ESP_LOGI(TAG, "Animation interrupted");
+            matrix_clear();
+            matrix_show();
+            xEventGroupClearBits(animation_events, ANIMATION_IN_PROGRESS_BIT);
+            return;
+        }
+        
+        int x = active_leds[i].x;
+        int y = active_leds[i].y;
+        
+        // Fade from NORMAL_BRIGHTNESS to FADE_MAX_INTENSITY
+        for (int step = 0; step <= FADE_STEPS; step++) {
+            uint8_t intensity = NORMAL_BRIGHTNESS + 
+                              ((FADE_MAX_INTENSITY - NORMAL_BRIGHTNESS) * step) / FADE_STEPS;
+            rgb_color_t curr_color = {.r = 0, .g = 0, .b = intensity};
+            matrix_set_pixel(x, y, curr_color);
+            matrix_show();
+            vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS));
+        }
+        
+        // Quick flash white
+        rgb_color_t white = {.r = FLASH_INTENSITY, .g = FLASH_INTENSITY, .b = FLASH_INTENSITY};
+        matrix_set_pixel(x, y, white);
+        matrix_show();
+        vTaskDelay(pdMS_TO_TICKS(50));  // Brief white flash
+        
+        // Fade from FADE_MAX_INTENSITY to 0
+        for (int step = FADE_STEPS; step >= 0; step--) {
+            uint8_t intensity = (step * FADE_MAX_INTENSITY) / FADE_STEPS;
+            rgb_color_t curr_color = {.r = 0, .g = 0, .b = intensity};
+            matrix_set_pixel(x, y, curr_color);
+            matrix_show();
+            vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS));
+        }
+        
+        // Ensure LED is completely off
+        rgb_color_t off = {.r = 0, .g = 0, .b = 0};
+        matrix_set_pixel(x, y, off);
+        matrix_show();
+        
+        vTaskDelay(pdMS_TO_TICKS(100));  // Pause between LEDs
+    }
+    
+    ESP_LOGI(TAG, "Dream animation complete, all LEDs turned off");
+    xEventGroupClearBits(animation_events, ANIMATION_IN_PROGRESS_BIT);
+    xEventGroupSetBits(animation_events, GENERATION_NEEDED_BIT);
+}
+
+void pause_animations(void) {
+    animation_enabled = false;
+    if (animation_events) {
+        // Wait for any current animation to complete or interrupt
+        xEventGroupWaitBits(animation_events, ANIMATION_IN_PROGRESS_BIT, 
+                           pdTRUE, pdTRUE, pdMS_TO_TICKS(1000));
+    }
+    matrix_clear();
+    matrix_show();
+}
+
+void resume_animations(void) {
+    animation_enabled = true;
 }

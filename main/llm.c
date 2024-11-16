@@ -691,33 +691,52 @@ void safe_printf(char *piece) {
         return;
     }
 
+    // Make a copy of the piece so we don't modify the original
+    char *temp_piece = malloc(strlen(piece) + 1);
+    if (!temp_piece) {
+        return;  // Memory allocation failed
+    }
+    strcpy(temp_piece, piece);
+
     // Ignore the initial " if it's the first character
-    if (output_pos == 0 && piece[0] == '"') {
-        piece++;  // Sposta il puntatore al prossimo carattere
+    if (output_pos == 0 && temp_piece[0] == '"') {
+        memmove(temp_piece, temp_piece + 1, strlen(temp_piece));
     }
 
     // Ignore special tokens "<s>" and "</s>"
-    if (strcmp(piece, "<s>") == 0 || strcmp(piece, "</s>") == 0) {
+    if (strcmp(temp_piece, "<s>") == 0 || strcmp(temp_piece, "</s>") == 0) {
+        free(temp_piece);
         return;
     }
 
-    
-    if (piece[1] == '\0') {
-        unsigned char byte_val = piece[0];
+    // Handle the case where <s> or </s> is part of the string
+    char *pos;
+    while ((pos = strstr(temp_piece, "<s>")) != NULL) {
+        memmove(pos, pos + 3, strlen(pos + 3) + 1);
+    }
+    while ((pos = strstr(temp_piece, "</s>")) != NULL) {
+        memmove(pos, pos + 4, strlen(pos + 4) + 1);
+    }
+
+    // Single character handling
+    if (strlen(temp_piece) == 1) {
+        unsigned char byte_val = temp_piece[0];
         if (!(isprint(byte_val) || isspace(byte_val))) {
+            free(temp_piece);
             return;
         }
     }
 
-    // Salva nel buffer e stampa
-    size_t len = strlen(piece);
-    if (output_pos + len < sizeof(output_buffer) - 1) {
-        memcpy(output_buffer + output_pos, piece, len);
+    // Save to buffer and print
+    size_t len = strlen(temp_piece);
+    if (output_pos + len < MAX_LLM_OUTPUT - 1) {
+        memcpy(output_buffer + output_pos, temp_piece, len);
         output_pos += len;
         output_buffer[output_pos] = '\0';
     }
 
-    printf("%s", piece);
+    printf("%s", temp_piece);
+    free(temp_piece);
 }
 
 
