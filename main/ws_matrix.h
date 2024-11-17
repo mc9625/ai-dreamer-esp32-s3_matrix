@@ -44,6 +44,11 @@
 #define ANIMATION_IN_PROGRESS_BIT (1 << 1)
 #define GENERATION_NEEDED_BIT (1 << 2)
 
+#define LIGHT_BLUE_G 0    // Verde per l'azzurro
+#define LIGHT_BLUE_B 255   // Blu pieno
+#define PULSE_MIN_B 160    // Blu minimo durante il pulse
+#define PULSE_MAX_B 255    // Blu massimo durante il pulse
+
 extern EventGroupHandle_t animation_events;
 
 bool wait_matrix_pattern_complete(void);

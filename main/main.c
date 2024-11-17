@@ -34,7 +34,11 @@ typedef struct {
 
 
 // Forward declarations
-static void generate_complete_cb(float tk_s);
+void generation_complete_callback(float tk_s) {
+    ESP_LOGI(TAG, "Generation complete: %.2f tok/s", tk_s);
+}
+
+
 static esp_err_t init_storage(void);
 static void wifi_start_callback(void);
 
@@ -87,32 +91,69 @@ static esp_err_t init_storage(void) {
 // LLM task
 static void llm_task(void *pvParameters) {
     LLMParams* params = (LLMParams*)pvParameters;
+    bool initial_generation = true;
     int disconnect_counter = 0;
     
+    ESP_LOGI("LLM_TASK", "Starting LLM task");
+    
     while(1) {
-        EventBits_t bits = xEventGroupGetBits(animation_events);
-        bool should_generate = (bits & GENERATION_NEEDED_BIT) && is_animation_enabled();
-        
-        if (should_generate) {
-            xEventGroupClearBits(animation_events, GENERATION_NEEDED_BIT);
-            // Generate text
-            generate(params->transformer, params->tokenizer, params->sampler,
-                    NULL, params->steps, params->callback);
+        if (initial_generation) {
+            ESP_LOGI("LLM_TASK", "Waiting for matrix initialization...");
             
-            // Animate dream and wait for completion
-            animate_dream(llm_output_buffer);
-            continue;
+            // Wait for matrix initialization
+            if (wait_matrix_pattern_complete()) {
+                ESP_LOGI("LLM_TASK", "Starting initial generation");
+                
+                // Generate first dream
+                generate(params->transformer, params->tokenizer, params->sampler,
+                        NULL, params->steps, params->callback);
+                
+                animate_dream(llm_output_buffer);
+                initial_generation = false;
+            } else {
+                ESP_LOGW("LLM_TASK", "Matrix init wait failed, retrying...");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+        } else {
+            // Check if we need to generate new content
+            EventBits_t bits = xEventGroupGetBits(animation_events);
+            bool needs_generation = (bits & GENERATION_NEEDED_BIT) != 0;
+            bool animation_active = (bits & ANIMATION_IN_PROGRESS_BIT) != 0;
+            
+            if (needs_generation && !animation_active && is_animation_enabled()) {
+                ESP_LOGI("LLM_TASK", "Starting new generation");
+                
+                // Clear generation flag before starting
+                xEventGroupClearBits(animation_events, GENERATION_NEEDED_BIT);
+                
+                // Generate new content
+                generate(params->transformer, params->tokenizer, params->sampler,
+                        NULL, params->steps, params->callback);
+                
+                // Start animation if no animation is currently running
+                animate_dream(llm_output_buffer);
+            }
         }
-
-        // Rest of WiFi state management...
+        
+        // Handle WiFi state
+        wifi_state_t wifi_state = wifi_manager_get_state();
+        if (wifi_state == WIFI_STATE_CLIENT_CONNECTED) {
+            disconnect_counter = 0;
+        } else if (wifi_state == WIFI_STATE_ON) {
+            disconnect_counter++;
+            if (disconnect_counter >= 300) {
+                disconnect_counter = 0;
+                ESP_LOGI("LLM_TASK", "No clients connected for 30 seconds, stopping WiFi");
+                wifi_manager_stop();
+                wifi_requested = false;
+            }
+        } else {
+            disconnect_counter = 0;
+        }
         
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-}
-
-// Callback for LLM generation completion
-static void generate_complete_cb(float tk_s) {
-    ESP_LOGI(TAG, "Generation complete: %.2f tok/s", tk_s);
 }
 
 void app_main(void) {
@@ -168,13 +209,13 @@ void app_main(void) {
     build_tokenizer(tokenizer, tokenizer_path, transformer->config.vocab_size);
     build_sampler(sampler, transformer->config.vocab_size, temperature, topp, esp_random());
 
-    // Create LLM parameters
+    // Create LLM parameters with the new callback
     LLMParams* llm_params = malloc(sizeof(LLMParams));
     llm_params->transformer = transformer;
     llm_params->tokenizer = tokenizer;
     llm_params->sampler = sampler;
     llm_params->steps = steps;
-    llm_params->callback = generate_complete_cb;
+    llm_params->callback = generation_complete_callback;  // Use the new non-static callback
 
     // Create LLM task
     xTaskCreate(llm_task, "llm_task", 16384,

@@ -1138,29 +1138,25 @@ long time_in_ms()
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
              char *prompt, int steps, generated_complete_cb cb_done) {
     // Reset output buffer
     output_pos = 0;
     output_buffer[0] = '\0';
 
     sampler->rng_state = (unsigned long long)time(NULL) ^ esp_random();
-
     ESP_LOGI(TAG, "Sampler RNG state reset: %llu", sampler->rng_state);
-
     
     reset_run_state(&transformer->state, &transformer->config);
     char *empty_prompt = "";
-    if (prompt == NULL)
-    {
+    if (prompt == NULL) {
         prompt = empty_prompt;
     }
 
     int num_prompt_tokens = 0;
     int *prompt_tokens = (int *)malloc((strlen(prompt) + 3) * sizeof(int));
     encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
-    if (num_prompt_tokens < 1)
-    {
+    if (num_prompt_tokens < 1) {
         ESP_LOGE(TAG, "something is wrong, expected at least 1 prompt token");
         exit(EXIT_FAILURE);
     }
@@ -1171,25 +1167,22 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     int pos = 0;                  
     int prev_x = -1, prev_y = -1;
     
-    const int NODE_ACTIVATION_INTERVAL = 5;
-    const int MAX_ACTIVE_NODES = 40;
+    const int MIN_ACTIVE_NODES = 45;  // Minimo numero di LED da mantenere accesi
+    const int MAX_ACTIVE_NODES = 55;  // Massimo numero di LED accesi
     int active_nodes = 0;
+    bool led_matrix[MATRIX_ROWS][MATRIX_COLS] = {0};  // Tiene traccia dei LED accesi
     
     int tokens_since_last_end = 0;
     bool in_sentence = false;
 
-    while (pos < steps)
-    {
+    while (pos < steps) {
         sampler->rng_state ^= (unsigned long long)pos * 6364136223846793005ULL + 1;
 
         v4sf *logits = forward(transformer, token, pos);
 
-        if (pos < num_prompt_tokens - 1)
-        {
+        if (pos < num_prompt_tokens - 1) {
             next = prompt_tokens[pos + 1];
-        }
-        else
-        {
+        } else {
             next = sample(sampler, logits);
         }
         pos++;
@@ -1198,48 +1191,97 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
         char *piece = decode(tokenizer, token, next);
         
         if (piece && piece[0] != '\0') {
-            // Controlla la fine della frase
             if (piece[0] == '.' || piece[0] == '!' || piece[0] == '?') {
                 tokens_since_last_end = 0;
                 in_sentence = false;
-            } else {
-                // Controlla se non è uno spazio usando il cast esplicito a unsigned char
-                if (!isspace((unsigned char)piece[0])) {
-                    in_sentence = true;
-                }
+            } else if (!isspace((unsigned char)piece[0])) {
+                in_sentence = true;
             }
         }
 
         // LED Matrix logic
-        if (pos % NODE_ACTIVATION_INTERVAL == 0 && active_nodes < MAX_ACTIVE_NODES) {
-            unsigned int hash = (unsigned int)next;
-            hash = (hash ^ 61) ^ (hash >> 16);
-            hash = hash + (hash << 3);
-            hash = hash ^ (hash >> 4);
-            hash = hash * 0x27d4eb2d;
+        if (active_nodes < MAX_ACTIVE_NODES) {
+            // Usa i logits per determinare le coordinate 2D
+            v4sf max_logit = -1e10;
+            v4sf min_logit = 1e10;
             
-            int base_x = (hash >> 16) % MATRIX_COLS;
-            int base_y = (hash & 0xFFFF) % MATRIX_ROWS;
-            
-            int x, y;
-            if (prev_x != -1 && prev_y != -1) {
-                x = prev_x + (base_x % 5 - 2);
-                y = prev_y + (base_y % 5 - 2);
-                x = (x + MATRIX_COLS) % MATRIX_COLS;
-                y = (y + MATRIX_ROWS) % MATRIX_ROWS;
-            } else {
-                x = base_x;
-                y = base_y;
+            for (int i = 0; i < transformer->config.vocab_size; i++) {
+                if (logits[i] > max_logit) max_logit = logits[i];
+                if (logits[i] < min_logit) min_logit = logits[i];
             }
-
-            int *coords = malloc(2 * sizeof(int));
-            if (coords != NULL) {
-                coords[0] = x;
-                coords[1] = y;
-                xTaskCreate(activate_new_node_task, "activate_node", 2048, coords, 5, NULL);
-                active_nodes++;
-                prev_x = x;
-                prev_y = y;
+            
+            v4sf l1 = logits[next];
+            v4sf l2 = logits[(next + 1) % transformer->config.vocab_size];
+            
+            int x = (int)(((l1 - min_logit) / (max_logit - min_logit)) * (MATRIX_COLS - 1));
+            int y = (int)(((l2 - min_logit) / (max_logit - min_logit)) * (MATRIX_ROWS - 1));
+            
+            bool led_activated = false;
+            
+            // Prova ad attivare il LED nella posizione calcolata
+            if (!led_matrix[y][x]) {
+                led_matrix[y][x] = true;
+                int *coords = malloc(2 * sizeof(int));
+                if (coords != NULL) {
+                    coords[0] = x;
+                    coords[1] = y;
+                    xTaskCreate(activate_new_node_task, "activate_node", 2048, coords, 5, NULL);
+                    active_nodes++;
+                    prev_x = x;
+                    prev_y = y;
+                    led_activated = true;
+                }
+            }
+            
+            // Se non abbiamo attivato il LED e siamo sotto il minimo, cerca altre posizioni
+            if (!led_activated && active_nodes < MIN_ACTIVE_NODES) {
+                // Prima prova posizioni adiacenti
+                for (int dy = -1; dy <= 1 && !led_activated; dy++) {
+                    for (int dx = -1; dx <= 1 && !led_activated; dx++) {
+                        if (dx == 0 && dy == 0) continue;
+                        
+                        int new_x = (prev_x + dx + MATRIX_COLS) % MATRIX_COLS;
+                        int new_y = (prev_y + dy + MATRIX_ROWS) % MATRIX_ROWS;
+                        
+                        if (!led_matrix[new_y][new_x]) {
+                            led_matrix[new_y][new_x] = true;
+                            int *coords = malloc(2 * sizeof(int));
+                            if (coords != NULL) {
+                                coords[0] = new_x;
+                                coords[1] = new_y;
+                                xTaskCreate(activate_new_node_task, "activate_node", 2048, coords, 5, NULL);
+                                active_nodes++;
+                                prev_x = new_x;
+                                prev_y = new_y;
+                                led_activated = true;
+                            }
+                        }
+                    }
+                }
+                
+                // Se ancora non abbiamo attivato un LED, prova posizioni casuali
+                if (!led_activated) {
+                    int attempts = 0;
+                    while (!led_activated && attempts < 10) {
+                        int new_x = esp_random() % MATRIX_COLS;
+                        int new_y = esp_random() % MATRIX_ROWS;
+                        
+                        if (!led_matrix[new_y][new_x]) {
+                            led_matrix[new_y][new_x] = true;
+                            int *coords = malloc(2 * sizeof(int));
+                            if (coords != NULL) {
+                                coords[0] = new_x;
+                                coords[1] = new_y;
+                                xTaskCreate(activate_new_node_task, "activate_node", 2048, coords, 5, NULL);
+                                active_nodes++;
+                                prev_x = new_x;
+                                prev_y = new_y;
+                                led_activated = true;
+                            }
+                        }
+                        attempts++;
+                    }
+                }
             }
         }
 
@@ -1267,6 +1309,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
         fprintf(stderr, "achieved tok/s: %f\n", tks);
         cb_done(tks);
     }
+    
     captive_portal_set_llm_output(output_buffer);
     free(prompt_tokens);
 }
