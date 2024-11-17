@@ -16,7 +16,7 @@
 #define T1L 16    // 0.45us
 
 static const char *TAG = "WS_MATRIX";
-static EventGroupHandle_t matrix_events = NULL;
+EventGroupHandle_t matrix_events = NULL;
 EventGroupHandle_t animation_events = NULL; 
 
 
@@ -544,6 +544,7 @@ void animate_dream(const char* dream_text) {
     const int COLOR_TRANSITION_STEPS = FADE_STEPS * 2;  // Più passi per una transizione più smooth
     rgb_color_t final_color = {.r = 0, .g = 0, .b = LIGHT_BLUE_B};
     
+    ESP_LOGI(TAG, "Starting color transition to light blue");
     for (int step = 0; step <= COLOR_TRANSITION_STEPS; step++) {
         for (int y = 0; y < MATRIX_ROWS; y++) {
             for (int x = 0; x < MATRIX_COLS; x++) {
@@ -560,41 +561,66 @@ void animate_dream(const char* dream_text) {
         vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS));
     }
     
-    // Effetto pulse più smooth e pronunciato
-    const int PULSE_DURATION_MS = 20000;
-    const uint8_t PULSE_MIN_BRIGHTNESS = 80;   // Più basso per un pulse più evidente
-    const uint8_t PULSE_MAX_BRIGHTNESS = 255;  // Full brightness
-    const int PULSE_TRANSITION_STEPS = 100;    // Più steps per un pulse più smooth
+    // Sample initial state before pulse
+    ESP_LOGI(TAG, "Starting pulse animation");
+    for (int y = 0; y < MATRIX_ROWS; y++) {
+        for (int x = 0; x < MATRIX_COLS; x++) {
+            if (framebuffer[y][x].b > 0) {
+                ESP_LOGI(TAG, "Pre-pulse LED at [%d,%d] brightness: %d", x, y, framebuffer[y][x].b);
+                break;  // Log just one LED as sample
+            }
+        }
+    }
     
+    ESP_LOGI(TAG, "Starting pulse animation");
+    
+    const int PULSE_DURATION_MS = 60000;  // 1 minuto
+    const uint8_t PULSE_MIN_BRIGHTNESS = 80;   
+    const uint8_t PULSE_MAX_BRIGHTNESS = 255;  
+    const int PULSE_TRANSITION_STEPS = 100;    
+    
+    // Add smooth transition to pulse start brightness
+    ESP_LOGI(TAG, "Transitioning to pulse start brightness");
+    for (int step = 0; step <= PULSE_TRANSITION_STEPS; step++) {
+        float ratio = (float)step / PULSE_TRANSITION_STEPS;
+        uint8_t intensity = LIGHT_BLUE_B - (uint8_t)((LIGHT_BLUE_B - PULSE_MIN_BRIGHTNESS) * ratio);
+        
+        for (int y = 0; y < MATRIX_ROWS; y++) {
+            for (int x = 0; x < MATRIX_COLS; x++) {
+                if (framebuffer[y][x].b > 0) {
+                    rgb_color_t curr_color = {.r = 0, .g = 0, .b = intensity};
+                    matrix_set_pixel(x, y, curr_color);
+                }
+            }
+        }
+        matrix_show();
+        vTaskDelay(pdMS_TO_TICKS(FADE_DELAY_MS/2));
+    }
+
+    ESP_LOGI(TAG, "Pulse parameters - MIN: %d, MAX: %d, STEPS: %d", 
+             PULSE_MIN_BRIGHTNESS, PULSE_MAX_BRIGHTNESS, PULSE_TRANSITION_STEPS);
+
     unsigned long start_time = esp_timer_get_time() / 1000;
+    int pulse_count = 0;
     
     while ((esp_timer_get_time() / 1000) - start_time < PULSE_DURATION_MS) {
+        // Log only first pulse cycle
+        if (pulse_count == 0) {
+            ESP_LOGI(TAG, "Starting first pulse UP transition");
+        }
+        
         // Pulse up super smooth
         for (int step = 0; step <= PULSE_TRANSITION_STEPS; step++) {
             float ratio = (float)step / PULSE_TRANSITION_STEPS;
-            // Uso di sin per una transizione più smooth
             float smooth_ratio = (sinf(ratio * M_PI - M_PI/2) + 1) / 2;
             uint8_t intensity = PULSE_MIN_BRIGHTNESS + 
                               (uint8_t)((PULSE_MAX_BRIGHTNESS - PULSE_MIN_BRIGHTNESS) * smooth_ratio);
             
-            for (int y = 0; y < MATRIX_ROWS; y++) {
-                for (int x = 0; x < MATRIX_COLS; x++) {
-                    if (framebuffer[y][x].b > 0) {
-                        rgb_color_t curr_color = {.r = 0, .g = 0, .b = intensity};
-                        matrix_set_pixel(x, y, curr_color);
-                    }
-                }
+            // Log key points in first pulse only
+            if (pulse_count == 0 && (step == 0 || step == PULSE_TRANSITION_STEPS/2 || step == PULSE_TRANSITION_STEPS)) {
+                ESP_LOGI(TAG, "Pulse UP - Step %d/%d: ratio %.3f, smooth_ratio %.3f, intensity %d", 
+                        step, PULSE_TRANSITION_STEPS, ratio, smooth_ratio, intensity);
             }
-            matrix_show();
-            vTaskDelay(pdMS_TO_TICKS(PULSE_DELAY_MS/2));  // Delay più corto per smoothness
-        }
-        
-        // Pulse down super smooth
-        for (int step = PULSE_TRANSITION_STEPS; step >= 0; step--) {
-            float ratio = (float)step / PULSE_TRANSITION_STEPS;
-            float smooth_ratio = (sinf(ratio * M_PI - M_PI/2) + 1) / 2;
-            uint8_t intensity = PULSE_MIN_BRIGHTNESS + 
-                              (uint8_t)((PULSE_MAX_BRIGHTNESS - PULSE_MIN_BRIGHTNESS) * smooth_ratio);
             
             for (int y = 0; y < MATRIX_ROWS; y++) {
                 for (int x = 0; x < MATRIX_COLS; x++) {
@@ -607,9 +633,44 @@ void animate_dream(const char* dream_text) {
             matrix_show();
             vTaskDelay(pdMS_TO_TICKS(PULSE_DELAY_MS/2));
         }
+        
+        if (pulse_count == 0) {
+            ESP_LOGI(TAG, "Starting first pulse DOWN transition");
+        }
+        
+        // Pulse down super smooth
+        for (int step = PULSE_TRANSITION_STEPS; step >= 0; step--) {
+            float ratio = (float)step / PULSE_TRANSITION_STEPS;
+            float smooth_ratio = (sinf(ratio * M_PI - M_PI/2) + 1) / 2;
+            uint8_t intensity = PULSE_MIN_BRIGHTNESS + 
+                              (uint8_t)((PULSE_MAX_BRIGHTNESS - PULSE_MIN_BRIGHTNESS) * smooth_ratio);
+            
+            // Log key points in first pulse only
+            if (pulse_count == 0 && (step == PULSE_TRANSITION_STEPS || step == PULSE_TRANSITION_STEPS/2 || step == 0)) {
+                ESP_LOGI(TAG, "Pulse DOWN - Step %d/%d: ratio %.3f, smooth_ratio %.3f, intensity %d", 
+                        step, PULSE_TRANSITION_STEPS, ratio, smooth_ratio, intensity);
+            }
+            
+            for (int y = 0; y < MATRIX_ROWS; y++) {
+                for (int x = 0; x < MATRIX_COLS; x++) {
+                    if (framebuffer[y][x].b > 0) {
+                        rgb_color_t curr_color = {.r = 0, .g = 0, .b = intensity};
+                        matrix_set_pixel(x, y, curr_color);
+                    }
+                }
+            }
+            matrix_show();
+            vTaskDelay(pdMS_TO_TICKS(PULSE_DELAY_MS/2));
+        }
+        
+        if (pulse_count == 0) {
+            ESP_LOGI(TAG, "Completed first pulse cycle");
+        }
+        pulse_count++;
     }
     
     // Reset finale più veloce
+    ESP_LOGI(TAG, "Starting final reset");
     for (int step = FADE_STEPS; step >= 0; step--) {
         for (int y = 0; y < MATRIX_ROWS; y++) {
             for (int x = 0; x < MATRIX_COLS; x++) {
@@ -634,7 +695,7 @@ void animate_dream(const char* dream_text) {
         vTaskDelay(pdMS_TO_TICKS(50)); // Small delay to ensure state change
         // Set generation needed flag
         xEventGroupSetBits(animation_events, GENERATION_NEEDED_BIT);
-    };
+    }
 }
 
 void pause_animations(void) {

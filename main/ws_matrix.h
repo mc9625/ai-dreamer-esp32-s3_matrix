@@ -51,6 +51,8 @@
 
 extern EventGroupHandle_t animation_events;
 
+extern EventGroupHandle_t matrix_events;
+
 bool wait_matrix_pattern_complete(void);
 
 

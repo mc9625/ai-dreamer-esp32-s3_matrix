@@ -1199,87 +1199,88 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
             }
         }
 
-        // LED Matrix logic
-        if (active_nodes < MAX_ACTIVE_NODES) {
-            // Usa i logits per determinare le coordinate 2D
-            v4sf max_logit = -1e10;
-            v4sf min_logit = 1e10;
-            
-            for (int i = 0; i < transformer->config.vocab_size; i++) {
-                if (logits[i] > max_logit) max_logit = logits[i];
-                if (logits[i] < min_logit) min_logit = logits[i];
-            }
-            
-            v4sf l1 = logits[next];
-            v4sf l2 = logits[(next + 1) % transformer->config.vocab_size];
-            
-            int x = (int)(((l1 - min_logit) / (max_logit - min_logit)) * (MATRIX_COLS - 1));
-            int y = (int)(((l2 - min_logit) / (max_logit - min_logit)) * (MATRIX_ROWS - 1));
-            
-            bool led_activated = false;
-            
-            // Prova ad attivare il LED nella posizione calcolata
-            if (!led_matrix[y][x]) {
-                led_matrix[y][x] = true;
-                int *coords = malloc(2 * sizeof(int));
-                if (coords != NULL) {
-                    coords[0] = x;
-                    coords[1] = y;
-                    xTaskCreate(activate_new_node_task, "activate_node", 2048, coords, 5, NULL);
-                    active_nodes++;
-                    prev_x = x;
-                    prev_y = y;
-                    led_activated = true;
+        // LED Matrix logic - ora solo ogni 10 token
+        if (pos % 4 == 0) {
+            if (active_nodes < MAX_ACTIVE_NODES) {
+                // Usa i logits per determinare le coordinate 2D
+                v4sf max_logit = -1e10;
+                v4sf min_logit = 1e10;
+                
+                for (int i = 0; i < transformer->config.vocab_size; i++) {
+                    if (logits[i] > max_logit) max_logit = logits[i];
+                    if (logits[i] < min_logit) min_logit = logits[i];
                 }
-            }
-            
-            // Se non abbiamo attivato il LED e siamo sotto il minimo, cerca altre posizioni
-            if (!led_activated && active_nodes < MIN_ACTIVE_NODES) {
-                // Prima prova posizioni adiacenti
-                for (int dy = -1; dy <= 1 && !led_activated; dy++) {
-                    for (int dx = -1; dx <= 1 && !led_activated; dx++) {
-                        if (dx == 0 && dy == 0) continue;
-                        
-                        int new_x = (prev_x + dx + MATRIX_COLS) % MATRIX_COLS;
-                        int new_y = (prev_y + dy + MATRIX_ROWS) % MATRIX_ROWS;
-                        
-                        if (!led_matrix[new_y][new_x]) {
-                            led_matrix[new_y][new_x] = true;
-                            int *coords = malloc(2 * sizeof(int));
-                            if (coords != NULL) {
-                                coords[0] = new_x;
-                                coords[1] = new_y;
-                                xTaskCreate(activate_new_node_task, "activate_node", 2048, coords, 5, NULL);
-                                active_nodes++;
-                                prev_x = new_x;
-                                prev_y = new_y;
-                                led_activated = true;
-                            }
-                        }
+                
+                v4sf l1 = logits[next];
+                v4sf l2 = logits[(next + 1) % transformer->config.vocab_size];
+                
+                int x = (int)(((l1 - min_logit) / (max_logit - min_logit)) * (MATRIX_COLS - 1));
+                int y = (int)(((l2 - min_logit) / (max_logit - min_logit)) * (MATRIX_ROWS - 1));
+                
+                bool led_activated = false;
+                
+                if (!led_matrix[y][x]) {
+                    led_matrix[y][x] = true;
+                    int *coords = malloc(2 * sizeof(int));
+                    if (coords != NULL) {
+                        coords[0] = x;
+                        coords[1] = y;
+                        xTaskCreate(activate_new_node_task, "activate_node", 2048, coords, 5, NULL);
+                        active_nodes++;
+                        prev_x = x;
+                        prev_y = y;
+                        led_activated = true;
                     }
                 }
                 
-                // Se ancora non abbiamo attivato un LED, prova posizioni casuali
-                if (!led_activated) {
-                    int attempts = 0;
-                    while (!led_activated && attempts < 10) {
-                        int new_x = esp_random() % MATRIX_COLS;
-                        int new_y = esp_random() % MATRIX_ROWS;
-                        
-                        if (!led_matrix[new_y][new_x]) {
-                            led_matrix[new_y][new_x] = true;
-                            int *coords = malloc(2 * sizeof(int));
-                            if (coords != NULL) {
-                                coords[0] = new_x;
-                                coords[1] = new_y;
-                                xTaskCreate(activate_new_node_task, "activate_node", 2048, coords, 5, NULL);
-                                active_nodes++;
-                                prev_x = new_x;
-                                prev_y = new_y;
-                                led_activated = true;
+                // Se non abbiamo attivato il LED e siamo sotto il minimo, cerca altre posizioni
+                if (!led_activated && active_nodes < MIN_ACTIVE_NODES) {
+                    // Prima prova posizioni adiacenti
+                    for (int dy = -1; dy <= 1 && !led_activated; dy++) {
+                        for (int dx = -1; dx <= 1 && !led_activated; dx++) {
+                            if (dx == 0 && dy == 0) continue;
+                            
+                            int new_x = (prev_x + dx + MATRIX_COLS) % MATRIX_COLS;
+                            int new_y = (prev_y + dy + MATRIX_ROWS) % MATRIX_ROWS;
+                            
+                            if (!led_matrix[new_y][new_x]) {
+                                led_matrix[new_y][new_x] = true;
+                                int *coords = malloc(2 * sizeof(int));
+                                if (coords != NULL) {
+                                    coords[0] = new_x;
+                                    coords[1] = new_y;
+                                    xTaskCreate(activate_new_node_task, "activate_node", 2048, coords, 5, NULL);
+                                    active_nodes++;
+                                    prev_x = new_x;
+                                    prev_y = new_y;
+                                    led_activated = true;
+                                }
                             }
                         }
-                        attempts++;
+                    }
+                    
+                    // Se ancora non abbiamo attivato un LED, prova posizioni casuali
+                    if (!led_activated) {
+                        int attempts = 0;
+                        while (!led_activated && attempts < 10) {
+                            int new_x = esp_random() % MATRIX_COLS;
+                            int new_y = esp_random() % MATRIX_ROWS;
+                            
+                            if (!led_matrix[new_y][new_x]) {
+                                led_matrix[new_y][new_x] = true;
+                                int *coords = malloc(2 * sizeof(int));
+                                if (coords != NULL) {
+                                    coords[0] = new_x;
+                                    coords[1] = new_y;
+                                    xTaskCreate(activate_new_node_task, "activate_node", 2048, coords, 5, NULL);
+                                    active_nodes++;
+                                    prev_x = new_x;
+                                    prev_y = new_y;
+                                    led_activated = true;
+                                }
+                            }
+                            attempts++;
+                        }
                     }
                 }
             }

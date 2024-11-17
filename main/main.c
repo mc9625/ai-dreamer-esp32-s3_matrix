@@ -96,44 +96,42 @@ static void llm_task(void *pvParameters) {
     
     ESP_LOGI("LLM_TASK", "Starting LLM task");
     
+    // Wait for matrix pattern to complete before starting
+    ESP_LOGI("LLM_TASK", "Waiting for matrix pattern to complete...");
+    while (!(xEventGroupGetBits(matrix_events) & MATRIX_PATTERN_COMPLETE_BIT)) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGI("LLM_TASK", "Matrix pattern complete, proceeding with generation");
+    
     while(1) {
         if (initial_generation) {
-            ESP_LOGI("LLM_TASK", "Waiting for matrix initialization...");
+            // Generate first dream
+            generate(params->transformer, params->tokenizer, params->sampler,
+                    NULL, params->steps, params->callback);
             
-            // Wait for matrix initialization
-            if (wait_matrix_pattern_complete()) {
-                ESP_LOGI("LLM_TASK", "Starting initial generation");
-                
-                // Generate first dream
-                generate(params->transformer, params->tokenizer, params->sampler,
-                        NULL, params->steps, params->callback);
-                
-                animate_dream(llm_output_buffer);
-                initial_generation = false;
-            } else {
-                ESP_LOGW("LLM_TASK", "Matrix init wait failed, retrying...");
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-        } else {
-            // Check if we need to generate new content
-            EventBits_t bits = xEventGroupGetBits(animation_events);
-            bool needs_generation = (bits & GENERATION_NEEDED_BIT) != 0;
-            bool animation_active = (bits & ANIMATION_IN_PROGRESS_BIT) != 0;
+            // Start first animation
+            animate_dream(llm_output_buffer);
+            initial_generation = false;
+            continue;
+        }
+        
+        // Check if we need to generate new content
+        EventBits_t bits = xEventGroupGetBits(animation_events);
+        bool needs_generation = (bits & GENERATION_NEEDED_BIT) != 0;
+        bool animation_active = (bits & ANIMATION_IN_PROGRESS_BIT) != 0;
+        
+        if (needs_generation && !animation_active && is_animation_enabled()) {
+            ESP_LOGI("LLM_TASK", "Starting new generation");
             
-            if (needs_generation && !animation_active && is_animation_enabled()) {
-                ESP_LOGI("LLM_TASK", "Starting new generation");
-                
-                // Clear generation flag before starting
-                xEventGroupClearBits(animation_events, GENERATION_NEEDED_BIT);
-                
-                // Generate new content
-                generate(params->transformer, params->tokenizer, params->sampler,
-                        NULL, params->steps, params->callback);
-                
-                // Start animation if no animation is currently running
-                animate_dream(llm_output_buffer);
-            }
+            // Clear generation flag before starting
+            xEventGroupClearBits(animation_events, GENERATION_NEEDED_BIT);
+            
+            // Generate new content
+            generate(params->transformer, params->tokenizer, params->sampler,
+                    NULL, params->steps, params->callback);
+            
+            // Start animation if no animation is currently running
+            animate_dream(llm_output_buffer);
         }
         
         // Handle WiFi state
